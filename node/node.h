@@ -3,6 +3,7 @@
  * 
 */
 #include <stdlib.h>
+#include <stdio.h>
 
 struct node;
 typedef struct node node;
@@ -99,3 +100,18 @@ int replace_file(node *this, char *filename, FILE* input);
  *     1 : An error occurred
 */
 int delete_file(node *this, char *filename);
+
+/*
+ * Returns a stream for reading the contents of the file with the given filename
+ * 
+ * Requires that the file is currently stored in the node
+ * The behavior of the stream is undefined if the given file is manipulated after read_file is called
+ * 
+ * @param filename
+ *     Name of the file to read from
+ * 
+ * @return
+ *     A stream associated with the given file
+ *     NULL is returned if an error is encountered
+*/
+FILE *read_file(node *this, char *filename);
