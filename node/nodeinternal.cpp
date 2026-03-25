@@ -57,3 +57,13 @@ int NodeInternal::read_file(char *filename) {
 NodeInternal::~NodeInternal() {
     free(directory_name);
 }
+
+
+
+
+
+char *NodeInternal::get_stored_filename(char *filename) {
+    char *path = (char*) malloc(PATH_MAX);
+    snprintf(path, PATH_MAX, "%s/storage/%s", directory_name, filename);
+    return path;
+}
