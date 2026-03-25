@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <limits.h>
 
-#include "nodeinternal.h"
+#include "nodeinternal.hpp"
 
 
 
