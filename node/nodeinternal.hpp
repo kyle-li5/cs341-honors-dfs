@@ -27,6 +27,11 @@ class NodeInternal {
         NodeInternal(int node_id);
 
         /*
+        * NodeInternal destructor
+        */
+        ~NodeInternal();
+
+        /*
         * Returns the total size of the files stored in the node in bytes.
         */
         size_t get_node_size();
