@@ -1,0 +1,59 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <limits.h>
+
+#include "nodeinternal.h"
+
+
+
+NodeInternal::NodeInternal() {
+    node_id = -1;
+    directory_name = realpath("./node-data/default", nullptr);
+    total_file_size = 0;
+}
+
+NodeInternal::NodeInternal(int node_id) {
+    this->node_id = node_id;
+
+    char buf[64];
+    snprintf(buf, 64, "./node-data/%d", node_id);
+    directory_name = realpath("./node-data/default", nullptr);
+
+    total_file_size = 0;
+}
+
+size_t NodeInternal::get_node_size() {
+    return total_file_size;
+}
+
+int NodeInternal::contains_file(char *filename) {
+    return -1; // TODO
+}
+
+char **NodeInternal::list_files() {
+    return NULL; // TODO
+}
+
+size_t NodeInternal::get_file_size(char *filename) {
+    return 0; // TODO
+}
+
+int NodeInternal::create_file(char *filename, int input) {
+    return -1; // TODO
+}
+
+int NodeInternal::replace_file(char *filename, int input) {
+    return -1; // TODO
+}
+
+int NodeInternal::delete_file(char *filename) {
+    return -1; // TODO
+}
+
+int NodeInternal::read_file(char *filename) {
+    return -1; // TODO
+}
+
+NodeInternal::~NodeInternal() {
+    free(directory_name);
+}
