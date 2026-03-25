@@ -9,26 +9,27 @@
 class NodeInternal {
     public:
         /*
-        * Creates a default NodeInternal object.
+        * Creates a default NodeInternal object
         * This node will store its information in the ./node-data/default directory
-        * This constructor should be used if no other nodes are being used in the current directory.
+        * This constructor should be used if no other nodes are being used in the current directory
         */
         NodeInternal();
 
         /*
-        * Creates a NodeInternal object.
+        * Creates a NodeInternal object
         * This node will store its information in the ./node-data/<node_id> directory
-        * This constructor should be used if multiple nodes are being used in the current directory.
+        * This constructor should be used if multiple nodes are being used in the current directory
         *
         * @param node_id
         *     The id of the node being created
+        *     This id must be non-negative
         */
-        NodeInternal(unsigned int node_id);
+        NodeInternal(int node_id);
 
         /*
         * Returns the total size of the files stored in the node in bytes.
         */
-        size_t node_size();
+        size_t get_node_size();
 
         /*
         * Returns whether or not the node is storing a file with the given filename
@@ -60,7 +61,7 @@ class NodeInternal {
         * @return
         *     Returns the size of the file in bytes
         */
-        size_t file_size(char *filename);
+        size_t get_file_size(char *filename);
 
         /*
         * Stores a new file in the node with the given filename
@@ -132,5 +133,11 @@ class NodeInternal {
         int read_file(char *filename);
 
     private:
-        // Some variables
+        char *get_stored_filename(char *filename);
+
+    private:
+        int node_id;
+        char *directory_name;
+        size_t total_file_size;
+
 };
