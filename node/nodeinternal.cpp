@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <vector>
 #include <queue>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "nodeinternal.hpp"
 
@@ -14,11 +16,12 @@ namespace fs = std::filesystem;
 
 NodeInternal::NodeInternal() {
     node_id = -1;
-    directory_path = realpath("./node-data/default", nullptr);
 
     fs::create_directory(fs::path("./node-data"));
     fs::create_directory(fs::path("./node-data/default"));
     fs::create_directory(fs::path("./node-data/default/storage"));
+
+    directory_path = realpath("./node-data/default", nullptr);
 
     storage_skip_amt = strlen(directory_path) + 9;
 }
@@ -28,10 +31,11 @@ NodeInternal::NodeInternal(int node_id) {
 
     char buf[64];
     snprintf(buf, 64, "./node-data/%d", node_id);
-    directory_path = realpath(buf, nullptr);
 
     fs::create_directory(fs::path("./node-data"));
     fs::create_directory(fs::path(buf));
+
+    directory_path = realpath(buf, nullptr);
 
     snprintf(buf, 64, "./node-data/%d/storage", node_id);
     fs::create_directory(fs::path(buf));
@@ -98,17 +102,64 @@ char **NodeInternal::list_files() {
     return list;
 }
 
-off_t NodeInternal::get_file_size(const char *filename) {
+off_t NodeInternal::get_file_size(const char *filename) { // Later, check if is directory and iterate through if so
     std::uintmax_t size = fs::file_size(get_fs_path(filename));
     return (off_t) size;
 }
 
 int NodeInternal::create_file(const char *filename, int input) {
-    return -1; // TODO
+    if (contains_file(filename)) {
+        return 1;
+    }
+
+    char *path_str = get_stored_filename(filename);
+    int output = open(path_str, O_WRONLY | O_CREAT);
+    free(path_str);
+
+    char *line = NULL;
+    size_t len = 0;
+
+    FILE *src_s = fdopen(input, "r");
+
+    while (getline(&line, &len, src_s) != -1) {
+        dprintf(output, "%s", line);
+    }
+
+    fclose(src_s);
+    free(line);
+    close(output);
+    close(input);
+
+    return 0;
 }
 
 int NodeInternal::replace_file(const char *filename, int input) {
-    return -1; // TODO
+    if (!contains_file(filename)) {
+        return 1;
+    }
+
+    delete_file(filename);
+    create_file(filename, input);
+
+    // char *path_str = get_stored_filename(filename);
+    // int output = open(filename, O_WRONLY | O_APPEND);
+    // free(path_str);
+    
+    // char *line = NULL;
+    // size_t len;
+
+    // FILE *src_s = fdopen(input, "r");
+
+    // while (getline(&line, &len, src_s) != -1) {
+    //     dprintf(output, "%s", line);
+    // }
+
+    // fclose(src_s);
+    // free(line);
+    // close(output);
+    // close(input);
+
+    return 0;
 }
 
 int NodeInternal::delete_file(const char *filename) {
@@ -116,7 +167,15 @@ int NodeInternal::delete_file(const char *filename) {
 }
 
 int NodeInternal::read_file(const char *filename) {
-    return -1; // TODO
+    if (!contains_file(filename)) {
+        return -1;
+    }
+
+    char *path_str = get_stored_filename(filename);
+    int fd = open(filename, O_RDONLY);
+    free(path_str);
+
+    return fd;
 }
 
 NodeInternal::~NodeInternal() {
