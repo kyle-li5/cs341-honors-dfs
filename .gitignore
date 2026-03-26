@@ -1,2 +1,4 @@
 /.vscode
 a.out
+node-data
+.DS_Store
