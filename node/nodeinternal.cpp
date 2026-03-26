@@ -2,15 +2,23 @@
 #include <stdio.h>
 #include <limits.h>
 #include <filesystem>
+#include <sys/stat.h>
+#include <vector>
+#include <queue>
 
 #include "nodeinternal.hpp"
+
+namespace fs = std::filesystem;
 
 
 
 NodeInternal::NodeInternal() {
     node_id = -1;
-    directory_name = realpath("./node-data/default", nullptr);
-    total_file_size = 0;
+    directory_path = realpath("./node-data/default", nullptr);
+
+    fs::create_directory(fs::path("./node-data"));
+    fs::create_directory(fs::path("./node-data/default"));
+    fs::create_directory(fs::path("./node-data/default/storage"));
 }
 
 NodeInternal::NodeInternal(int node_id) {
@@ -18,60 +26,89 @@ NodeInternal::NodeInternal(int node_id) {
 
     char buf[64];
     snprintf(buf, 64, "./node-data/%d", node_id);
-    directory_name = realpath("./node-data/default", nullptr);
+    directory_path = realpath(buf, nullptr);
 
-    total_file_size = 0;
+    fs::create_directory(fs::path("./node-data"));
+    fs::create_directory(fs::path(buf));
+
+    snprintf(buf, 64, "./node-data/%d/storage", node_id);
+    fs::create_directory(fs::path(buf));
 }
 
-size_t NodeInternal::get_node_size() {
-    return total_file_size;
-}
-
-int NodeInternal::contains_file(char *filename) {
-    return std::filesystem::exists(get_fs_path(filename));
-}
-
-char **NodeInternal::list_files() {
-    return NULL; // TODO
-}
-
-size_t NodeInternal::get_file_size(char *filename) {
+off_t NodeInternal::get_node_size() {
     return 0; // TODO
 }
 
-int NodeInternal::create_file(char *filename, int input) {
+int NodeInternal::contains_file(const char *filename) {
+    return fs::exists(get_fs_path(filename));
+}
+
+char **NodeInternal::list_files() {
+    std::vector<fs::path> file_paths;
+    std::queue<fs::directory_iterator> to_parse;
+
+    // Add storage directory iterator to queue to parse later.
+    char storage_path[PATH_MAX];
+    snprintf(storage_path, PATH_MAX, "%s/storage", directory_path);
+    fs::path storage_fs_path = fs::path(storage_path);
+    fs::directory_iterator top_it(storage_fs_path);
+
+    to_parse.push(top_it);
+
+    // Define end iterator. This end is shared among all directory_iterators.
+    fs::directory_iterator end;
+
+    // Collect file paths or add new directory iterators to queue for all iterators
+    while (!to_parse.empty()) {
+        fs::directory_iterator it = to_parse.front();
+        to_parse.pop();
+
+        // TODO
+    }
+
+
+
+    return NULL; // TODO
+}
+
+off_t NodeInternal::get_file_size(const char *filename) {
+    std::uintmax_t size = fs::file_size(get_fs_path(filename));
+    return (off_t) size;
+}
+
+int NodeInternal::create_file(const char *filename, int input) {
     return -1; // TODO
 }
 
-int NodeInternal::replace_file(char *filename, int input) {
+int NodeInternal::replace_file(const char *filename, int input) {
     return -1; // TODO
 }
 
-int NodeInternal::delete_file(char *filename) {
-    return -1; // TODO
+int NodeInternal::delete_file(const char *filename) {
+    return !fs::remove(get_fs_path(filename));
 }
 
-int NodeInternal::read_file(char *filename) {
+int NodeInternal::read_file(const char *filename) {
     return -1; // TODO
 }
 
 NodeInternal::~NodeInternal() {
-    free(directory_name);
+    free(directory_path);
 }
 
 
 
 
 
-char *NodeInternal::get_stored_filename(char *filename) {
+char *NodeInternal::get_stored_filename(const char *filename) {
     char *path = (char*) malloc(PATH_MAX);
-    snprintf(path, PATH_MAX, "%s/storage/%s", directory_name, filename);
+    snprintf(path, PATH_MAX, "%s/storage/%s", directory_path, filename);
     return path;
 }
 
-std::filesystem::path NodeInternal::get_fs_path(char *filename) {
+fs::path NodeInternal::get_fs_path(const char *filename) {
     char *str_path = get_stored_filename(filename);
-    std::filesystem::path fs_path = std::filesystem::path(str_path);
+    fs::path fs_path = fs::path(str_path);
     free(str_path);
     return fs_path;
 }

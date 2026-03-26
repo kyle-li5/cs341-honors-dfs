@@ -35,7 +35,7 @@ class NodeInternal {
         /*
         * Returns the total size of the files stored in the node in bytes.
         */
-        size_t get_node_size();
+        off_t get_node_size();
 
         /*
         * Returns whether or not the node is storing a file with the given filename
@@ -47,7 +47,7 @@ class NodeInternal {
         *     0 : File not found
         *     1 : File found
         */
-        int contains_file(char *filename);
+        int contains_file(const char *filename);
 
         /*
         * Returns the names of the files stored in the node
@@ -60,6 +60,7 @@ class NodeInternal {
         /*
         * Gets the size of the file with the given filename in bytes
         * Undefined for files not currently stored in the node
+        * IMPORTANT - Does not work for directories right now
         *
         * @param filename
         *     Name of the file
@@ -67,7 +68,7 @@ class NodeInternal {
         * @return
         *     Returns the size of the file in bytes
         */
-        size_t get_file_size(char *filename);
+        off_t get_file_size(const char *filename);
 
         /*
         * Stores a new file in the node with the given filename
@@ -87,7 +88,7 @@ class NodeInternal {
         *     0 : No errors were encountered
         *     1 : An error occurred
         */
-        int create_file(char *filename, int input);
+        int create_file(const char *filename, int input);
 
         /*
         * Replaces the contents of the stored file with the given filename
@@ -107,7 +108,7 @@ class NodeInternal {
         *     0 : No errors were encountered
         *     1 : An error occurred
         */
-        int replace_file(char *filename, int input);
+        int replace_file(const char *filename, int input);
 
         /*
         * Deletes the file with the given filename from the node
@@ -121,7 +122,7 @@ class NodeInternal {
         *     0 : No errors were encountered
         *     1 : An error occurred
         */
-        int delete_file(char *filename);
+        int delete_file(const char *filename);
 
         /*
         * Returns a file descriptor for reading the contents of the file with the given filename
@@ -136,16 +137,15 @@ class NodeInternal {
         *     A file descriptor associated with the specified file
         *     -1 is returned if an error is encountered
         */
-        int read_file(char *filename);
+        int read_file(const char *filename);
 
     private:
-        char *get_stored_filename(char *filename);
+        char *get_stored_filename(const char *filename);
 
-        std::filesystem::path get_fs_path(char *filepath);
+        std::filesystem::path get_fs_path(const char *filepath);
 
     private:
         int node_id;
-        char *directory_name;
-        size_t total_file_size;
+        char *directory_path;
 
 };
