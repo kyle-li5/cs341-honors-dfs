@@ -147,5 +147,6 @@ class NodeInternal {
     private:
         int node_id;
         char *directory_path;
+        size_t storage_skip_amt;
 
 };

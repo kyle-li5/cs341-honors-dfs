@@ -19,6 +19,8 @@ NodeInternal::NodeInternal() {
     fs::create_directory(fs::path("./node-data"));
     fs::create_directory(fs::path("./node-data/default"));
     fs::create_directory(fs::path("./node-data/default/storage"));
+
+    storage_skip_amt = strlen(directory_path) + 9;
 }
 
 NodeInternal::NodeInternal(int node_id) {
@@ -33,10 +35,30 @@ NodeInternal::NodeInternal(int node_id) {
 
     snprintf(buf, 64, "./node-data/%d/storage", node_id);
     fs::create_directory(fs::path(buf));
+
+    storage_skip_amt = strlen(directory_path) + 9;
 }
 
 off_t NodeInternal::get_node_size() {
-    return 0; // TODO
+    off_t size = 0;
+
+    // Create iterator for files
+    char storage_path[PATH_MAX];
+    snprintf(storage_path, PATH_MAX, "%s/storage", directory_path);
+    fs::path storage_fs_path = fs::path(storage_path);
+    fs::recursive_directory_iterator it(storage_fs_path);
+
+    // Define end iterator
+    fs::recursive_directory_iterator end;
+    
+    // Sum sizes
+    for (; it != end; ++it) {
+        if (it->is_regular_file()) {
+            size += it->file_size();
+        }
+    }
+
+    return size;
 }
 
 int NodeInternal::contains_file(const char *filename) {
@@ -45,30 +67,35 @@ int NodeInternal::contains_file(const char *filename) {
 
 char **NodeInternal::list_files() {
     std::vector<fs::path> file_paths;
-    std::queue<fs::directory_iterator> to_parse;
 
-    // Add storage directory iterator to queue to parse later.
+    // Create iterator for files
     char storage_path[PATH_MAX];
     snprintf(storage_path, PATH_MAX, "%s/storage", directory_path);
     fs::path storage_fs_path = fs::path(storage_path);
-    fs::directory_iterator top_it(storage_fs_path);
+    fs::recursive_directory_iterator it(storage_fs_path);
 
-    to_parse.push(top_it);
-
-    // Define end iterator. This end is shared among all directory_iterators.
-    fs::directory_iterator end;
-
-    // Collect file paths or add new directory iterators to queue for all iterators
-    while (!to_parse.empty()) {
-        fs::directory_iterator it = to_parse.front();
-        to_parse.pop();
-
-        // TODO
+    // Define end iterator
+    fs::recursive_directory_iterator end;
+    
+    // Collect all file paths
+    for (; it != end; ++it) {
+        if (it->is_regular_file()) {
+            file_paths.push_back(it->path());
+        }
     }
 
+    // Convert paths into char*'s relative to the storage directory
+    char **list = (char**) malloc(sizeof(char*) * (file_paths.size() + 1));
+    list[file_paths.size()] = NULL;
+    for (size_t i = 0; i < file_paths.size(); i++) {
+        const char *orig = file_paths[i].c_str();
+        size_t orig_len = strlen(orig);
+        size_t amt_to_cpy = orig_len - storage_skip_amt;
+        list[i] = (char*) malloc(amt_to_cpy + 1);
+        strncpy(list[i], orig + storage_skip_amt, amt_to_cpy + 1);
+    }
 
-
-    return NULL; // TODO
+    return list;
 }
 
 off_t NodeInternal::get_file_size(const char *filename) {
