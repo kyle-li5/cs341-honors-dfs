@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>
+#include <filesystem>
 
 #include "nodeinternal.hpp"
 
@@ -27,7 +28,7 @@ size_t NodeInternal::get_node_size() {
 }
 
 int NodeInternal::contains_file(char *filename) {
-    return -1; // TODO
+    return std::filesystem::exists(get_fs_path(filename));
 }
 
 char **NodeInternal::list_files() {
@@ -66,4 +67,11 @@ char *NodeInternal::get_stored_filename(char *filename) {
     char *path = (char*) malloc(PATH_MAX);
     snprintf(path, PATH_MAX, "%s/storage/%s", directory_name, filename);
     return path;
+}
+
+std::filesystem::path NodeInternal::get_fs_path(char *filename) {
+    char *str_path = get_stored_filename(filename);
+    std::filesystem::path fs_path = std::filesystem::path(str_path);
+    free(str_path);
+    return fs_path;
 }

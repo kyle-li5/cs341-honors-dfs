@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <filesystem>
 
 class NodeInternal {
     public:
@@ -139,6 +140,8 @@ class NodeInternal {
 
     private:
         char *get_stored_filename(char *filename);
+
+        std::filesystem::path get_fs_path(char *filepath);
 
     private:
         int node_id;
