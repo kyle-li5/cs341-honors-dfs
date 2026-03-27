@@ -114,20 +114,15 @@ int NodeInternal::create_file(const char *filename, int input) {
     }
 
     char *path_str = get_stored_filename(filename);
-    int output = open(path_str, O_WRONLY | O_CREAT);
+    int output = open(path_str, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     free(path_str);
 
-    char *line = NULL;
-    size_t len = 0;
-
-    FILE *src_s = fdopen(input, "r");
-
-    while (getline(&line, &len, src_s) != -1) {
-        dprintf(output, "%s", line);
+    char buf[4096];
+    ssize_t bytes_read;
+    while ((bytes_read = read(input, buf, sizeof(buf))) > 0) {
+        write(output, buf, bytes_read);
     }
 
-    fclose(src_s);
-    free(line);
     close(output);
     close(input);
 

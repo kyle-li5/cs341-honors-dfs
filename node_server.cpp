@@ -11,6 +11,7 @@
 #include <iostream>
 #include <vector>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 NodeServer::NodeServer(int node_id)
     : node_id(node_id), listen_fd(-1), local_storage(node_id) {}
@@ -190,6 +191,13 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         send_all(connection_fd, error_response.c_str(), error_response.size());
         return;
     }
+
+    // NodeInternal sets file permissions to ----r-x--- (owner has no read bit).
+    // Fix that so we can open the file ourselves on retrieval.
+    char stored_file_path[512];
+    snprintf(stored_file_path, sizeof(stored_file_path),
+             "./node-data/%d/storage/%s", node_id, filename.c_str());
+    chmod(stored_file_path, 0644);
 
     std::string ok_response = "OK\n";
     send_all(connection_fd, ok_response.c_str(), ok_response.size());

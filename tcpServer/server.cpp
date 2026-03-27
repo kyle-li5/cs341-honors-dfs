@@ -11,6 +11,17 @@
 #include <filesystem>
 #include <algorithm>
 
+// Added to support node routing and distributed storage
+#include <mutex>
+#include <unordered_map>
+#include <chrono>
+#include <csignal>
+#include <arpa/inet.h>
+
+#include "node_server.hpp"
+#include "tcp_helpers.hpp"
+#include "constants.hpp"
+
 // g++ -std=c++17 server.cpp -o server -pthread
 // ./server
 
@@ -28,8 +39,6 @@
 //   Test with Python client:
 //   python3 test_client.py
 
-
-
 // Protocol:
 // Client sends: COMMAND [args]\n
 // Server responds: OK [data]\n or ERROR [message]\n
@@ -39,19 +48,57 @@
 //   UPLOAD <filename> <size>  - Upload a file (followed by <size> bytes)
 //   DOWNLOAD <filename>       - Download a file
 //   DELETE <filename>         - Delete a file
+//   STATUS                    - Show storage info across all nodes
 //   QUIT                      - Close connection
 
 namespace fs = std::filesystem;
 
 std::atomic<int> client_count(0);
-const std::string STORAGE_DIR = "./storage/";
 
-// Initialize storage directory
-void init_storage() {
-    if (!fs::exists(STORAGE_DIR)) {
-        fs::create_directory(STORAGE_DIR);
-        std::cout << "Created storage directory: " << STORAGE_DIR << "\n";
+// Tracks which node a file lives on and how large it is.
+// The server uses this to route DOWNLOAD and DELETE to the right node.
+struct FileMetadata {
+    int    node_id;
+    size_t filesize;
+};
+
+static std::unordered_map<std::string, FileMetadata> file_metadata_map;
+static std::mutex metadata_mutex;
+
+// Cycles 0 -> 1 -> 2 -> 0 to spread uploads evenly across nodes
+static int next_node_index = 0;
+
+// Global listen fd so the signal handler can close it on Ctrl+C
+static int server_listen_fd = -1;
+
+static void handle_shutdown_signal(int signal_number) {
+    std::cout << "\n[server] shutting down (signal " << signal_number << ")\n";
+    if (server_listen_fd >= 0) {
+        close(server_listen_fd);
     }
+    _exit(0);
+}
+
+// Opens a TCP connection to a node running on localhost at NODE_BASE_PORT + node_id.
+// Returns the connection fd, or -1 if the connection failed.
+static int connect_to_node(int node_id) {
+    int connection_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connection_fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in node_address;
+    memset(&node_address, 0, sizeof(node_address));
+    node_address.sin_family = AF_INET;
+    node_address.sin_port   = htons(NODE_BASE_PORT + node_id);
+    inet_pton(AF_INET, "127.0.0.1", &node_address.sin_addr);
+
+    if (connect(connection_fd, (struct sockaddr *)&node_address, sizeof(node_address)) < 0) {
+        close(connection_fd);
+        return -1;
+    }
+
+    return connection_fd;
 }
 
 // Send a response to the client
@@ -92,118 +139,225 @@ bool read_exact(int client_fd, char* buffer, size_t size) {
     return true;
 }
 
-// Handle LIST command
+// Queries each node for its file list and sends a combined listing to the client.
+// Response format: "OK <count>\n" followed by one "<filename> <size>\n" per file.
+// Sending the count first lets the client know exactly how many lines to read.
 void handle_list(int client_fd, int client_id) {
     std::cout << "[Client " << client_id << "] LIST\n";
 
-    std::stringstream ss;
-    int count = 0;
+    std::lock_guard<std::mutex> lock(metadata_mutex);
 
-    for (const auto& entry : fs::directory_iterator(STORAGE_DIR)) {
-        if (entry.is_regular_file()) {
-            ss << entry.path().filename().string() << " ";
-            ss << entry.file_size() << " bytes\n";
-            count++;
-        }
-    }
+    std::string header = "OK " + std::to_string(file_metadata_map.size()) + "\n";
+    send_all(client_fd, header.c_str(), header.size());
 
-    if (count == 0) {
-        send_response(client_fd, "OK No files stored");
-    } else {
-        send_response(client_fd, "OK " + std::to_string(count) + " files:\n" + ss.str());
+    for (auto &entry : file_metadata_map) {
+        std::string file_line = entry.first + " "
+                                + std::to_string(entry.second.filesize) + "\n";
+        send_all(client_fd, file_line.c_str(), file_line.size());
     }
 }
 
-// Handle UPLOAD command
-void handle_upload(int client_fd, int client_id, const std::string& filename, size_t size) {
-    std::cout << "[Client " << client_id << "] UPLOAD " << filename << " (" << size << " bytes)\n";
+// Receives the file from the client then forwards it to a storage node.
+// Picks the next node round-robin, or reuses the same node if the file already exists.
+void handle_upload(int client_fd, int client_id, const std::string& filename, size_t filesize) {
+    std::cout << "[Client " << client_id << "] UPLOAD " << filename
+              << " (" << filesize << " bytes)\n";
 
-    // Validate filename (prevent directory traversal)
+    // Validate filename to prevent directory traversal attacks
     if (filename.find("..") != std::string::npos || filename.find("/") != std::string::npos) {
         send_response(client_fd, "ERROR Invalid filename");
         return;
     }
 
-    std::string filepath = STORAGE_DIR + filename;
-    std::ofstream file(filepath, std::ios::binary);
-
-    if (!file.is_open()) {
-        send_response(client_fd, "ERROR Failed to create file");
+    // Receive file bytes from the client into a buffer
+    std::vector<char> file_buffer(filesize);
+    if (!read_exact(client_fd, file_buffer.data(), filesize)) {
+        send_response(client_fd, "ERROR Connection lost during upload");
         return;
     }
 
-    // Read file data
-    const size_t CHUNK_SIZE = 4096;
-    char buffer[CHUNK_SIZE];
-    size_t remaining = size;
-
-    while (remaining > 0) {
-        size_t to_read = std::min(remaining, CHUNK_SIZE);
-        if (!read_exact(client_fd, buffer, to_read)) {
-            send_response(client_fd, "ERROR Connection lost during upload");
-            file.close();
-            fs::remove(filepath);  // Clean up partial file
-            return;
+    // If the file already exists, send to the same node. Otherwise pick next round-robin.
+    int target_node_id;
+    bool is_overwrite = false;
+    {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        auto existing_entry = file_metadata_map.find(filename);
+        if (existing_entry != file_metadata_map.end()) {
+            target_node_id = existing_entry->second.node_id;
+            is_overwrite   = true;
+        } else {
+            target_node_id  = next_node_index;
+            next_node_index = (next_node_index + 1) % NUM_NODES;
         }
-        file.write(buffer, to_read);
-        remaining -= to_read;
     }
 
-    file.close();
-    send_response(client_fd, "OK File uploaded successfully");
-    std::cout << "[Client " << client_id << "] Upload complete: " << filename << "\n";
+    // Forward the file to the target node
+    int node_connection_fd = connect_to_node(target_node_id);
+    if (node_connection_fd < 0) {
+        send_response(client_fd, "ERROR Could not reach storage node");
+        return;
+    }
+
+    std::string store_command = "NODE_STORE " + filename + " "
+                               + std::to_string(filesize) + "\n";
+    send_all(node_connection_fd, store_command.c_str(), store_command.size());
+    send_all(node_connection_fd, file_buffer.data(), filesize);
+
+    std::string node_response;
+    if (recv_line(node_connection_fd, node_response) != 0
+            || node_response.substr(0, 2) != "OK") {
+        close(node_connection_fd);
+        send_response(client_fd, "ERROR Storage node failed to store file");
+        return;
+    }
+    close(node_connection_fd);
+
+    // Record the file location in the metadata map
+    {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        file_metadata_map[filename] = {target_node_id, filesize};
+    }
+
+    if (is_overwrite) {
+        send_response(client_fd, "OK File updated successfully");
+    } else {
+        send_response(client_fd, "OK File uploaded successfully");
+    }
+
+    std::cout << "[Client " << client_id << "] Upload complete: " << filename
+              << " -> node " << target_node_id << "\n";
 }
 
-// Handle DOWNLOAD command
+// Looks up which node has the file, retrieves it, and streams it to the client.
 void handle_download(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DOWNLOAD " << filename << "\n";
 
-    std::string filepath = STORAGE_DIR + filename;
+    int target_node_id;
+    {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        auto entry = file_metadata_map.find(filename);
+        if (entry == file_metadata_map.end()) {
+            send_response(client_fd, "ERROR File not found");
+            return;
+        }
+        target_node_id = entry->second.node_id;
+    }
 
-    if (!fs::exists(filepath)) {
-        send_response(client_fd, "ERROR File not found");
+    int node_connection_fd = connect_to_node(target_node_id);
+    if (node_connection_fd < 0) {
+        send_response(client_fd, "ERROR Could not reach storage node");
         return;
     }
 
-    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        send_response(client_fd, "ERROR Failed to open file");
+    std::string retrieve_command = "NODE_RETRIEVE " + filename + "\n";
+    send_all(node_connection_fd, retrieve_command.c_str(), retrieve_command.size());
+
+    // Node responds with "FILE <filename> <filesize>\n<bytes>"
+    std::string node_response;
+    if (recv_line(node_connection_fd, node_response) != 0) {
+        close(node_connection_fd);
+        send_response(client_fd, "ERROR Node disconnected");
         return;
     }
 
-    size_t filesize = file.tellg();
-    file.seekg(0);
-
-    // Send OK response with file size
-    send_response(client_fd, "OK " + std::to_string(filesize));
-
-    // Send file data
-    const size_t CHUNK_SIZE = 4096;
-    char buffer[CHUNK_SIZE];
-
-    while (file.read(buffer, CHUNK_SIZE) || file.gcount() > 0) {
-        send(client_fd, buffer, file.gcount(), 0);
+    if (node_response.substr(0, 4) != "FILE") {
+        close(node_connection_fd);
+        send_response(client_fd, "ERROR " + node_response);
+        return;
     }
 
-    file.close();
+    // Parse "FILE <filename> <filesize>"
+    std::istringstream response_stream(node_response);
+    std::string tag, received_filename;
+    size_t received_filesize;
+    response_stream >> tag >> received_filename >> received_filesize;
+
+    std::vector<char> file_buffer(received_filesize);
+    if (recv_file_data(node_connection_fd, received_filesize, file_buffer.data()) != 0) {
+        close(node_connection_fd);
+        send_response(client_fd, "ERROR Failed to read file from node");
+        return;
+    }
+    close(node_connection_fd);
+
+    // Send OK with filesize so client knows how many bytes to read
+    send_response(client_fd, "OK " + std::to_string(received_filesize));
+    send(client_fd, file_buffer.data(), received_filesize, 0);
+
     std::cout << "[Client " << client_id << "] Download complete: " << filename << "\n";
 }
 
-// Handle DELETE command
+// Tells the node holding the file to delete it, then removes it from the metadata map.
 void handle_delete(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DELETE " << filename << "\n";
 
-    std::string filepath = STORAGE_DIR + filename;
+    int target_node_id;
+    {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        auto entry = file_metadata_map.find(filename);
+        if (entry == file_metadata_map.end()) {
+            send_response(client_fd, "ERROR File not found");
+            return;
+        }
+        target_node_id = entry->second.node_id;
+    }
 
-    if (!fs::exists(filepath)) {
-        send_response(client_fd, "ERROR File not found");
+    int node_connection_fd = connect_to_node(target_node_id);
+    if (node_connection_fd < 0) {
+        send_response(client_fd, "ERROR Could not reach storage node");
         return;
     }
 
-    if (fs::remove(filepath)) {
+    std::string delete_command = "NODE_DELETE " + filename + "\n";
+    send_all(node_connection_fd, delete_command.c_str(), delete_command.size());
+
+    std::string node_response;
+    recv_line(node_connection_fd, node_response);
+    close(node_connection_fd);
+
+    if (node_response.substr(0, 2) == "OK") {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        file_metadata_map.erase(filename);
         send_response(client_fd, "OK File deleted");
     } else {
         send_response(client_fd, "ERROR Failed to delete file");
+    }
+}
+
+// Queries each node for its file count and total storage used, then sends a summary.
+// Response format: "OK <node_count>\n" followed by one "NODE <id> <files> <bytes>\n" per node.
+void handle_status(int client_fd, int client_id) {
+    std::cout << "[Client " << client_id << "] STATUS\n";
+
+    std::string header = "OK " + std::to_string(NUM_NODES) + "\n";
+    send_all(client_fd, header.c_str(), header.size());
+
+    for (int node_id = 0; node_id < NUM_NODES; node_id++) {
+        int node_connection_fd = connect_to_node(node_id);
+        if (node_connection_fd < 0) {
+            std::string unreachable_line = "NODE " + std::to_string(node_id) + " unreachable\n";
+            send_all(client_fd, unreachable_line.c_str(), unreachable_line.size());
+            continue;
+        }
+
+        std::string status_command = "NODE_STATUS\n";
+        send_all(node_connection_fd, status_command.c_str(), status_command.size());
+
+        std::string node_response;
+        recv_line(node_connection_fd, node_response);
+        close(node_connection_fd);
+
+        // Node responds with "STATUS <file_count> <total_bytes>"
+        std::istringstream response_stream(node_response);
+        std::string tag;
+        int file_count = 0;
+        long long total_bytes = 0;
+        response_stream >> tag >> file_count >> total_bytes;
+
+        std::string node_line = "NODE " + std::to_string(node_id) + " "
+                                + std::to_string(file_count) + " "
+                                + std::to_string(total_bytes) + "\n";
+        send_all(client_fd, node_line.c_str(), node_line.size());
     }
 }
 
@@ -211,7 +365,7 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
 void handle_client(int client_fd, int client_id) {
     std::cout << "[Client " << client_id << "] Connected\n";
 
-    send_response(client_fd, "OK Welcome to DFS Server. Commands: LIST, UPLOAD, DOWNLOAD, DELETE, QUIT");
+    send_response(client_fd, "OK Welcome to DFS Server. Commands: LIST, UPLOAD, DOWNLOAD, DELETE, STATUS, QUIT");
 
     // Persistent connection loop
     while (true) {
@@ -226,28 +380,25 @@ void handle_client(int client_fd, int client_id) {
         std::string cmd;
         iss >> cmd;
 
-        // Convert to uppercase
+        // Convert to uppercase so commands work regardless of how client types them
         std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
 
         if (cmd == "QUIT") {
             send_response(client_fd, "OK Goodbye");
             break;
-        }
-        else if (cmd == "LIST") {
+        } else if (cmd == "LIST") {
             handle_list(client_fd, client_id);
-        }
-        else if (cmd == "UPLOAD") {
+        } else if (cmd == "UPLOAD") {
             std::string filename;
-            size_t size;
-            iss >> filename >> size;
+            size_t filesize;
+            iss >> filename >> filesize;
 
-            if (filename.empty() || size == 0) {
+            if (filename.empty() || filesize == 0) {
                 send_response(client_fd, "ERROR Usage: UPLOAD <filename> <size>");
             } else {
-                handle_upload(client_fd, client_id, filename, size);
+                handle_upload(client_fd, client_id, filename, filesize);
             }
-        }
-        else if (cmd == "DOWNLOAD") {
+        } else if (cmd == "DOWNLOAD") {
             std::string filename;
             iss >> filename;
 
@@ -256,8 +407,7 @@ void handle_client(int client_fd, int client_id) {
             } else {
                 handle_download(client_fd, client_id, filename);
             }
-        }
-        else if (cmd == "DELETE") {
+        } else if (cmd == "DELETE") {
             std::string filename;
             iss >> filename;
 
@@ -266,9 +416,10 @@ void handle_client(int client_fd, int client_id) {
             } else {
                 handle_delete(client_fd, client_id, filename);
             }
-        }
-        else {
-            send_response(client_fd, "ERROR Unknown command. Available: LIST, UPLOAD, DOWNLOAD, DELETE, QUIT");
+        } else if (cmd == "STATUS") {
+            handle_status(client_fd, client_id);
+        } else {
+            send_response(client_fd, "ERROR Unknown command. Available: LIST, UPLOAD, DOWNLOAD, DELETE, STATUS, QUIT");
         }
     }
 
@@ -278,8 +429,20 @@ void handle_client(int client_fd, int client_id) {
 }
 
 int main() {
-    // Initialize storage directory
-    init_storage();
+    signal(SIGINT,  handle_shutdown_signal);
+    signal(SIGTERM, handle_shutdown_signal);
+
+    // Start all storage nodes before accepting client connections.
+    // Each node runs in its own background thread on its own port.
+    std::vector<NodeServer *> storage_nodes;
+    for (int node_id = 0; node_id < NUM_NODES; node_id++) {
+        NodeServer *node = new NodeServer(node_id);
+        storage_nodes.push_back(node);
+        node->start();
+    }
+
+    // Give nodes a moment to bind their ports before we start accepting clients
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -315,6 +478,11 @@ int main() {
         return 1;
     }
 
+    server_listen_fd = server_fd;
+
+    std::cout << "=== Distributed File System Server ===\n";
+    std::cout << "Storage nodes on ports "
+              << NODE_BASE_PORT << " to " << (NODE_BASE_PORT + NUM_NODES - 1) << "\n";
     std::cout << "Server listening on port 9000...\n";
     std::cout << "Press Ctrl+C to stop\n\n";
 

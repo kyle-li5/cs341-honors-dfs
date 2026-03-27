@@ -1,8 +1,9 @@
 CXX      = g++
-CXXFLAGS = -std=c++17 -Wall -pthread
+# -I. so that tcpServer/server.cpp can find headers at the repo root
+CXXFLAGS = -std=c++17 -Wall -pthread -I.
 
 # server binary - runs on the Pi, starts the server coordinator and all storage nodes
-SERVER_SOURCES = server.cpp node_server.cpp tcp_helpers.cpp node/nodeinternal.cpp
+SERVER_SOURCES = tcpServer/server.cpp node_server.cpp tcp_helpers.cpp node/nodeinternal.cpp
 
 # client binary - runs on your laptop, connects to the server
 CLIENT_SOURCES = client.cpp tcp_helpers.cpp
