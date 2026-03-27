@@ -59,9 +59,12 @@ void NodeServer::run() {
         return;
     }
 
-    std::cout << "[node " << node_id << "] listening on port "
-              << (NODE_BASE_PORT + node_id) << "\n";
-    std::cout.flush();
+    {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cout << "[node " << node_id << "] listening on port "
+                  << (NODE_BASE_PORT + node_id) << "\n";
+        std::cout.flush();
+    }
 
     while (true) {
         int connection_fd = accept(listen_fd, nullptr, nullptr);

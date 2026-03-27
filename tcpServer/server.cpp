@@ -55,6 +55,9 @@ namespace fs = std::filesystem;
 
 std::atomic<int> client_count(0);
 
+// Shared mutex so concurrent threads don't interleave their console output
+std::mutex print_mutex;
+
 // Tracks which node a file lives on and how large it is.
 // The server uses this to route DOWNLOAD and DELETE to the right node.
 struct FileMetadata {

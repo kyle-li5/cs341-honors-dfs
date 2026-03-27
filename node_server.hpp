@@ -4,6 +4,9 @@
 #include <mutex>
 #include "node/nodeinternal.hpp"
 
+// Shared mutex for serializing console output across threads
+extern std::mutex print_mutex;
+
 // NodeInternal (node/nodeinternal.hpp) handles local file storage but has no
 // networking - it can only be used directly by code running on the same machine.
 // NodeServer wraps NodeInternal with a TCP listener so server.cpp can send
