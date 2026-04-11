@@ -102,9 +102,36 @@ char **NodeInternal::list_files() {
     return list;
 }
 
-off_t NodeInternal::get_file_size(const char *filename) { // Later, check if is directory and iterate through if so
-    std::uintmax_t size = fs::file_size(get_fs_path(filename));
-    return (off_t) size;
+off_t NodeInternal::get_file_size(const char *filename) {
+    fs::path fs_path = get_fs_path(filename);
+    if (fs::is_directory(fs_path)) {
+        // sum size of contents
+        off_t size = 0;
+
+        // Create iterator for files
+        fs::recursive_directory_iterator it(fs_path);
+
+        // Define end iterator
+        fs::recursive_directory_iterator end;
+        
+        // Sum sizes
+        for (; it != end; ++it) {
+            if (it->is_regular_file()) {
+                size += it->file_size();
+            }
+        }
+
+        return size;
+
+    } else if (fs::is_regular_file(fs_path)) {
+        // check size normally
+        std::uintmax_t size = fs::file_size(get_fs_path(filename));
+        return (off_t) size;
+
+    } else {
+        // Error
+        return -1;
+    }
 }
 
 int NodeInternal::create_file(const char *filename, int input) {
