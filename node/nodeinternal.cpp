@@ -113,7 +113,7 @@ int NodeInternal::create_file(const char *filename, int input) {
     }
 
     char *path_str = get_stored_filename(filename);
-    int output = open(path_str, O_WRONLY | O_CREAT);
+    int output = open(path_str, O_WRONLY | O_CREAT, 0b110110110);
     free(path_str);
 
     char *line = NULL;
@@ -172,7 +172,7 @@ int NodeInternal::read_file(const char *filename) {
     }
 
     char *path_str = get_stored_filename(filename);
-    int fd = open(filename, O_RDONLY);
+    int fd = open(path_str, O_RDONLY);
     free(path_str);
 
     return fd;
