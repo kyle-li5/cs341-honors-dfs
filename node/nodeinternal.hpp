@@ -60,7 +60,6 @@ class NodeInternal {
         /*
         * Gets the size of the file with the given filename in bytes
         * Undefined for files not currently stored in the node
-        * IMPORTANT - Does not work for directories right now
         *
         * @param filename
         *     Name of the file
