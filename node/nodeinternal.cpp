@@ -72,7 +72,7 @@ NodeInternal::NodeInternal(int node_id) {
 
 void NodeInternal::clear_existing_data(void) {
     int fd_status = open(status_path, O_WRONLY | O_TRUNC);
-    write(fd_status, "i", 1); // idle
+    write(fd_status, "c", 1); // clearing node
     close(fd_status);
 
     int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
@@ -83,6 +83,10 @@ void NodeInternal::clear_existing_data(void) {
     fs::path storage_path = fs::path(buf);
     fs::remove_all(storage_path);
     fs::create_directory(storage_path);
+
+    fd_status = open(status_path, O_WRONLY | O_TRUNC);
+    write(fd_status, "i", 1); // idle
+    close(fd_status);
 }
 
 off_t NodeInternal::get_node_size() {
@@ -312,6 +316,14 @@ int NodeInternal::check_error(void) {
             return 2;
         }
 
+        case 'c': {
+            return 4;
+        }
+
+        case 't': {
+            return 5;
+        }
+
         default: {
             return 1;
         }
@@ -355,12 +367,16 @@ fs::path NodeInternal::get_fs_path(const char *filename) {
 void NodeInternal::indicate_start_modifying(const char *filename) {
     if (cur_modifying == 0) {
         int fd_status = open(status_path, O_WRONLY | O_TRUNC);
-        write(fd_status, "m", 1); // modifying something
+        write(fd_status, "t", 1); // transitioning status
         close(fd_status);
 
         int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
         write(fd_modifying, filename, strlen(filename));
         close(fd_modifying);
+
+        fd_status = open(status_path, O_WRONLY | O_TRUNC);
+        write(fd_status, "m", 1); // modifying something
+        close(fd_status);
     }
 
     ++cur_modifying;
@@ -370,10 +386,14 @@ void NodeInternal::indicate_end_modifying(void) {
     --cur_modifying;
 
     if (cur_modifying == 0) {
+        int fd_status = open(status_path, O_WRONLY | O_TRUNC);
+        write(fd_status, "t", 1); // transitioning status
+        close(fd_status);
+
         int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
         close(fd_modifying);
 
-        int fd_status = open(status_path, O_WRONLY | O_TRUNC);
+        fd_status = open(status_path, O_WRONLY | O_TRUNC);
         write(fd_status, "i", 1); // idle
         close(fd_status);
     }

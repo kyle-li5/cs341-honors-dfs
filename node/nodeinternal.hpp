@@ -202,8 +202,10 @@ class NodeInternal {
         *       A nonzero value corresponding to the error detected, or zero if no error is detected
         *       0 : No Error
         *       1 : Unknown Error
-        *       2 : An old node operating in the same location was interrupted while manipulating a file. (The data corresponding to this error will be cleared if a file is manipulated, so this should be checked and dealt with immediately after a node has been created.)
+        *       2 : An old node was interrupted while manipulating a file. (The data corresponding to this error will be cleared if a file is manipulated, so this should be checked and dealt with immediately after a node has been created.)
         *       3 : No status information is present. (This will occur if the node has just been created, no files have been manipulated, and there was not preexisting data for the node to find.)
+        *       4 : An old node was interrupted while clearing its data
+        *       5 : An old node was interrupted while changing its status
         */
        int check_error(void);
 
