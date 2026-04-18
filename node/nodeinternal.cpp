@@ -67,7 +67,11 @@ off_t NodeInternal::get_node_size() {
 }
 
 int NodeInternal::contains_file(const char *filename) {
-    return fs::exists(get_fs_path(filename));
+    return contains(filename);
+}
+
+int NodeInternal::contains(const char *path) {
+    return fs::exists(get_fs_path(path));
 }
 
 char **NodeInternal::list_files() {
@@ -169,29 +173,35 @@ int NodeInternal::replace_file(const char *filename, int input) {
     delete_file(filename);
     create_file(filename, input);
 
-    // char *path_str = get_stored_filename(filename);
-    // int output = open(filename, O_WRONLY | O_APPEND);
-    // free(path_str);
-    
-    // char *line = NULL;
-    // size_t len;
-
-    // FILE *src_s = fdopen(input, "r");
-
-    // while (getline(&line, &len, src_s) != -1) {
-    //     dprintf(output, "%s", line);
-    // }
-
-    // fclose(src_s);
-    // free(line);
-    // close(output);
-    // close(input);
-
     return 0;
 }
 
 int NodeInternal::delete_file(const char *filename) {
     return !fs::remove(get_fs_path(filename));
+}
+
+int NodeInternal::create_directory(const char *dirname) {
+    if (contains(dirname)) {
+        return 1;
+    }
+    
+    if (!fs::create_directory(get_fs_path(dirname))) {
+        return 1;
+    }
+
+    return 0;
+}
+
+int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
+    if (delete_contents) {
+        std::uintmax_t num_deleted = fs::remove_all(get_fs_path(dirname));
+        if (num_deleted == 0 || num_deleted == (std::uintmax_t) -1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    return !fs::remove(get_fs_path(dirname));
 }
 
 int NodeInternal::read_file(const char *filename) {
