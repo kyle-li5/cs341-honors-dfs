@@ -11,7 +11,10 @@ void test2(void);
 void test3(void);
 void test4(void);
 
+void test_file_dir(void);
+
 void test1node(NodeInternal &node);
+void test1node_file_dir(NodeInternal &node);
 void clean_up_files(void);
 void test_duplicate_streams(int fd1, int fd2);
 void print_stream(int fd);
@@ -28,9 +31,25 @@ int main(void) {
     test3();
     test4();
 
+    test_file_dir();
+
     clean_up_files();
 
     printf("All tests passed.\n");
+}
+
+void test_file_dir(void) {
+    clean_up_files();
+
+    NodeInternal node_def = NodeInternal();
+    test1node_file_dir(node_def);
+
+    for (size_t i = 0; i < 5; ++i) {
+        NodeInternal node_numeric = NodeInternal(i);
+        test1node_file_dir(node_numeric);
+    }
+
+    clean_up_files();
 }
 
 void test1node(NodeInternal &node) { // Assumes no content in node to start with
@@ -158,3 +177,109 @@ void test4(void) {
         test1node(node);
     }
 }
+
+void test_add_new_file(NodeInternal &node, const char *original_path, const char *node_path, off_t size) {
+    int input_fd1 = open(original_path, O_RDONLY);
+
+    assert(!node.contains(node_path));
+    assert(node.create_file(node_path, input_fd1) == 0);
+    assert(node.contains_file(node_path));
+    assert(node.get_file_size(node_path) == size);
+
+    int input_fd2 = open(original_path, O_RDONLY);
+    test_duplicate_streams(node.read_file(node_path), input_fd2);
+}
+
+void test_rm_file(NodeInternal &node, const char *node_path) {
+    assert(node.contains(node_path));
+    assert(node.delete_file(node_path) == 0);
+    assert(!node.contains_file(node_path));
+    assert(node.delete_file(node_path) == 1);
+}
+
+void test_add_new_dir(NodeInternal &node, const char *dir_path) {
+    assert(!node.contains(dir_path));
+    assert(node.create_directory(dir_path) == 0);
+    assert(node.create_directory(dir_path) == 1);
+    assert(node.contains(dir_path));
+}
+
+void test_rm_dir(NodeInternal &node, const char *dir_path) {
+    assert(node.contains(dir_path));
+    assert(node.delete_directory(dir_path, 0) == 0);
+    assert(node.delete_directory(dir_path, 0) == 1);
+    assert(node.delete_directory(dir_path, 1) == 1);
+    assert(!node.contains(dir_path));
+}
+
+void test_rm_f_dir(NodeInternal &node, const char *dir_path) {
+    assert(node.contains(dir_path));
+    assert(node.delete_directory(dir_path, 1) == 0);
+    assert(node.delete_directory(dir_path, 0) == 1);
+    assert(node.delete_directory(dir_path, 1) == 1);
+    assert(!node.contains(dir_path));
+}
+
+void test_rm_fail_with_files_dir(NodeInternal &node, const char *dir_path) {
+    assert(node.contains(dir_path));
+    assert(node.delete_directory(dir_path, 0) == 1);
+    assert(node.contains(dir_path));
+}
+
+void test1node_file_dir(NodeInternal &node) {
+    // Assumes empty node
+
+    test_add_new_file(node, "./node/test-files/bird.ogg", "sound.ogg", 407587);
+    test_rm_file(node, "sound.ogg");
+    test_add_new_file(node, "./node/test-files/bird.ogg", "sound.ogg", 407587);
+
+    test_add_new_dir(node, "pictures-of-salt");
+    test_rm_dir(node, "pictures-of-salt");
+    test_add_new_dir(node, "pictures-of-salt");
+
+    test_add_new_file(node, "./node/test-files/salt.jpg", "pictures-of-salt/salt_a.jpg", 26128322);
+    test_add_new_file(node, "./node/test-files/salt.jpg", "pictures-of-salt/salt_b.jpg", 26128322);
+    test_add_new_file(node, "./node/test-files/salt.jpg", "pictures-of-salt/salt_c.jpg", 26128322);
+
+    assert(node.get_file_size("pictures-of-salt") == 26128322 * 3);
+
+    test_rm_fail_with_files_dir(node, "pictures-of-salt");
+    test_rm_f_dir(node, "pictures-of-salt");
+
+    test_add_new_dir(node, "library");
+    test_add_new_dir(node, "library/bookshelf");
+    test_add_new_dir(node, "library/counter");
+    test_add_new_dir(node, "library/floor");
+
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/bookshelf/book1.txt", 3293568);
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/bookshelf/book2.txt", 3293568);
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/bookshelf/book3.txt", 3293568);
+
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/counter/book1.txt", 3293568);
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/counter/book2.txt", 3293568);
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/counter/book3.txt", 3293568);
+
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/bookshelf/book4.txt", 3293568);
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/bookshelf/book5.txt", 3293568);
+
+    test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/floor/book1.txt", 3293568);
+
+    assert(node.get_file_size("library") == 3293568 * 9);
+    assert(node.get_file_size("library/bookshelf") == 3293568 * 5);
+    assert(node.get_file_size("library/counter") == 3293568 * 3);
+    assert(node.get_file_size("library/floor") == 3293568 * 1);
+
+    test_rm_fail_with_files_dir(node, "library/bookshelf");
+    test_rm_f_dir(node, "library/bookshelf");
+
+    test_rm_file(node, "library/floor/book1.txt");
+    test_rm_dir(node, "library/floor");
+
+    assert(node.get_file_size("library") == 3293568 * 3);
+
+    test_rm_fail_with_files_dir(node, "library");
+    test_rm_f_dir(node, "library");
+
+    test_rm_file(node, "sound.ogg");
+}
+
