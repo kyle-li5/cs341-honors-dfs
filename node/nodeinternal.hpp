@@ -195,6 +195,29 @@ class NodeInternal {
         */
         int read_file(const char *filename);
 
+        /*
+        * Checks if there is an error in with the node
+        *
+        * @return
+        *       A nonzero value corresponding to the error detected, or zero if no error is detected
+        *       0 : No Error
+        *       1 : Unknown Error
+        *       2 : An old node operating in the same location was interrupted while manipulating a file. (The data corresponding to this error will be cleared if a file is manipulated, so this should be checked and dealt with immediately after a node has been created.)
+        *       3 : No status information is present. (This will occur if the node has just been created, no files have been manipulated, and there was not preexisting data for the node to find.)
+        */
+       int check_error(void);
+
+       /*
+       * Returns additional information corresponding to the error number passed in
+       *
+       * This behavior is undefined if the error number is not one listed below, or if the passed error number is not a current error.
+       * 
+       * @return
+       *        Information corresponding to the passed error number
+       *        2 : The path (for the node's functions) of the file whose manipulation was interrupted
+       */
+       char *get_error_info(int error);
+
     private:
         char *get_stored_filename(const char *filename);
 

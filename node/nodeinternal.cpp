@@ -294,6 +294,49 @@ NodeInternal::~NodeInternal() {
 
 
 
+int NodeInternal::check_error(void) {
+    int fd_status = open(status_path, O_RDONLY);
+    char buf[1];
+    ssize_t bytes_read = read(fd_status, buf, 1);
+
+    if (bytes_read == 0) {
+        return 3;
+    }
+
+    switch (buf[0]) {
+        case 'i': {
+            return 0;
+        }
+
+        case 'm': {
+            return 2;
+        }
+
+        default: {
+            return 1;
+        }
+    }
+}
+
+char *NodeInternal::get_error_info(int error) {
+    int fd_modifying;
+    ssize_t bytes_read;
+
+    switch (error) {
+        case 2:
+            fd_modifying = open(modifying_path, O_RDONLY);
+            char buf[PATH_MAX];
+            bytes_read = read(fd_modifying, buf, PATH_MAX);
+            buf[bytes_read] = '\0';
+            printf("%s\n", buf);
+            return strdup(buf);
+
+        default:
+            return NULL;
+    }
+}
+
+
 
 
 char *NodeInternal::get_stored_filename(const char *filename) {
