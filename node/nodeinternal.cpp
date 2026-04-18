@@ -30,12 +30,11 @@ NodeInternal::NodeInternal() {
 
     // init metadata files
 
-    int fd_status = open("./node-data/default/status.dat", O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
-    write(fd_status, "i", 1); // idle
+    int fd_status = open("./node-data/default/status.dat", O_WRONLY | O_CREAT, 0b110110110);
     close(fd_status);
     status_path = realpath("./node-data/default/status.dat", nullptr);
 
-    int fd_modifying = open("./node-data/default/modifying.dat", O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
+    int fd_modifying = open("./node-data/default/modifying.dat", O_WRONLY | O_CREAT, 0b110110110);
     close(fd_modifying);
     modifying_path = realpath("./node-data/default/modifying.dat", nullptr);
 }
@@ -61,15 +60,29 @@ NodeInternal::NodeInternal(int node_id) {
     // init metadata files
 
     snprintf(buf, 64, "./node-data/%d/status.dat", node_id);
-    int fd_status = open(buf, O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
-    write(fd_status, "i", 1); // idle
+    int fd_status = open(buf, O_WRONLY | O_CREAT, 0b110110110);
     close(fd_status);
     status_path = realpath(buf, nullptr);
 
     snprintf(buf, 64, "./node-data/%d/modifying.dat", node_id);
-    int fd_modifying = open(buf, O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
+    int fd_modifying = open(buf, O_WRONLY | O_CREAT, 0b110110110);
     close(fd_modifying);
     modifying_path = realpath(buf, nullptr);
+}
+
+void NodeInternal::clear_existing_data(void) {
+    int fd_status = open(status_path, O_WRONLY | O_TRUNC);
+    write(fd_status, "i", 1); // idle
+    close(fd_status);
+
+    int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
+    close(fd_modifying);
+
+    char buf[256];
+    snprintf(buf, 256, "%s/storage", directory_path);
+    fs::path storage_path = fs::path(buf);
+    fs::remove_all(storage_path);
+    fs::create_directory(storage_path);
 }
 
 off_t NodeInternal::get_node_size() {
