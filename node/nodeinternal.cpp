@@ -148,7 +148,7 @@ int NodeInternal::create_file(const char *filename, int input) {
     int output = open(path_str, O_WRONLY | O_CREAT, 0b110110110);
     free(path_str);
 
-    char buf[2048];
+    char buf[4096];
     ssize_t read_bytes = 0;
 
     while ((read_bytes = read(input, buf, 2048)) > 0) {
@@ -189,15 +189,25 @@ int NodeInternal::create_directory(const char *dirname) {
 }
 
 int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
+    fs::path fs_path = get_fs_path(dirname);
+
+    if (!fs::is_directory(fs_path)) {
+        return 1;
+    }
+
     if (delete_contents) {
-        std::uintmax_t num_deleted = fs::remove_all(get_fs_path(dirname));
+        std::uintmax_t num_deleted = fs::remove_all(fs_path);
         if (num_deleted == 0 || num_deleted == (std::uintmax_t) -1) {
             return 1;
         }
         return 0;
     }
 
-    return !fs::remove(get_fs_path(dirname));
+    if (!fs::is_empty(fs_path)) {
+        return 1;
+    }
+
+    return !fs::remove(fs_path);
 }
 
 int NodeInternal::read_file(const char *filename) {
