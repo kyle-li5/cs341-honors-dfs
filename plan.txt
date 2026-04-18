@@ -1,0 +1,134 @@
+Raspberry Pi NAS Server From Scratch (Distributed File System)
+
+Intended Activities for Project:
+[what are the general steps you will take to do this project ~100 words]
+
+We are hoping to do weekly meetings to complete this project on time, meeting for 2-3 hours a week, to share what we have done with each other, to share advice or ideas, or to just directly work on the project. Our current plan is to meet on Thursdays. We will look for online resources and possibly watch tutorials, read books, consult staff and professors, whatever might be needed to help us do the project and learn while doing it. There is a distributed systems course and we can even ask the professor for that class for possible help and understanding the concepts better.
+
+Expected Results:
+[what is the expected outcome of this project? what is the behavior of your successfully completed embedded system ~100 words]
+
+The expected outcome of the project is for us to have a fully functional “google drive esque” website or command line tool such that we can upload, download, update, and delete files to/from a remote server. For example, we could upload a file like readme.txt and our project would upload and save that file to a server, which we could then access and download from the server.
+
+We are implementing our server as a distributed file system, so our server will be split into multiple nodes and designed to recover if some nodes fail. Our server will also have some internal management to maintain file backups and load balances between its nodes.
+
+If we have additional time, we may implement some sort of authentication system to allow multiple users to use one server functionally independently.
+
+We may also implement a version control system to help users recover their files if they mistakenly delete or change them.
+
+
+
+
+
+
+
+Related Concepts:
+[what cs341/embedded concepts will you be working with/do you foresee using in your project ~list these out, and explain each]
+Networking/Sockets: TCP/IP and socket programming is fundamental; this is how a client talks to the server
+Files and I/O:  reading/writing files, understanding directories, and the POSIX file interface is the backbone of any file system project
+Processes and Threads: a server handling multiple clients concurrently will need to spawn threads or processes per connection
+Synchronization: critical for handling concurrent reads/writes to the same files without corruption
+Memory management: efficient buffering of file data being transferred over the network
+
+
+Equipment & Resources Needed:
+[what will you need to complete this project? reminder that we can only provide the devices stated on slack. any other devices will need to be funded by you or borrowed by you from another source. be sure to account for this acquisition in your timeline below]
+
+All we need is the Raspberry Pi and our own devices.
+
+Project Plan (Milestones, Qualifications, and Responsibilities):
+[this should be the most elaborate portion of your proposal. here, you should be listing out a weekly timeline of intended steps to make toward your final project goal. you should explain who will be responsible for what tasks, and how you will communicate such responsibilities. provide context for each group member, and what they are familiar with]
+
+Task and Familiarities:
+Hayden
+Joey
+Jacob 
+Kyle
+Internal Node Behavior
+TCP & Interface
+Communication between nodes
+Communication between nodes
+
+
+All: communicate and help each other 
+Week
+Date
+Tasks
+1
+02/21-02/27
+Research and Setup: We want to research what technologies and coding language we want to use for this, and what a NAS actually is and a high level architecture of what to implement. Setup the github repository.
+2
+02/28-03/06
+Look into TCP: We want to start coding up a basic TCP server that can accept client connections. (sockets, networking, client connection)
+
+Look into splitting up the Pi into nodes: We want to make our filesystem distributed with multiple simulated nodes. We will look into how to best implement this, such as with VMs or forking multiple processes.
+3
+03/07-03/13
+Finish coding TCP server: Testing and making sure it works.
+
+Finish splitting up Pi into nodes: Testing and making sure it works.
+
+Implement interface: Implement a basic interface to allow client interaction with the server.
+(Sub-task: Verify TCP servers on nodes can interact with other nodes)
+4
+03/14-03/20
+ - Spring Break -
+Reading up on distributed systems and resting.
+5
+03/21-03/27
+Send/Handle requests from client: We want to make sure that the Pi can see the requests and is able to appropriately handle it (read, get, update stuff on the Pi)
+
+Research how to distribute files: We want to distribute files across the nodes evenly and with redundancies to protect against data loss if one node fails. We need to figure out how to achieve that on a single Pi and how to implement the logic
+6
+03/28-04/03
+
+
+Complete Midterm Presentation (due on 03/30)
+7
+04/04-04/10
+Start implementing logic to distribute files: We want to research how a file is actually distributed across multiple nodes, and whether or not we want to try splitting up the file into multiple pieces or just storing duplicates of files.
+8
+04/11-04/17
+Implement monitoring nodes to shift loads/backup files: We want to allow nodes to detect if other nodes have been lost, and to replace them as needed. We also want to ensure files are stored evenly across all nodes at all times
+9
+04/18-04/24
+Test file system: Test uploading/downloading/deleting files extensively to make sure everything is working correctly.
+10
+04/25-05/01
+Create user-friendly wrapper for client interface: We want a simple, intuitive interface for users to interact with the server. This may be through the CLI or a website.
+11
+05/02-05/08
+Buffer time to finish tasks/fix bugs
+
+Optional tasks if we have time: version history, user authentication
+12
+05/09-05/11
+Finish Details, Finalize Final Presentation
+
+
+
+
+
+Communication: 
+[here, you should explain how your group intends to communicate to work on this project. you should additionally list when/how frequently you intend to meet to work. remember that work on your project should take about 3 hours a week for each member of the team]
+
+We will communicate with each other and our mentor on Discord. We will meet once a week on Thursdays online or in-person to discuss what we’ve worked on over the past week and what we need to do for the next week. 
+
+Links to GitHub Repository & Other Sources:
+[you will need to push your code to some kind of repository, so please link that (and any other sources) here]
+https://github.com/kyle-li5/cs341-honors-dfs 
+
+
+
+In case you need Wentao's GitHub handle: @whentojump
+
+
+[Feel free to incorporate your thoughts into the proposal then delete the below]
+Things to consider:
+What architecture is your file service: single server? potentially extended to multiple nodes for reliability and performance? What is the protocol of data replication? You may read something such as "primary-backup", "chain replication", "distributed hash table"...]
+User interface: command line-based, API-based (REST, gRPC, ...?) or web/graphical-based?
+Do we plan encryption and authentication?
+Do we plan version history and checkpointing?  
+Language? Rust allowed? -- Staff: Yes
+
+
