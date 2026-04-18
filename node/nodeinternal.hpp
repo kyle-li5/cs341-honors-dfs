@@ -33,6 +33,13 @@ class NodeInternal {
         ~NodeInternal();
 
         /*
+        * Removes any stored files or metadata
+        * 
+        * After calling this, the NodeInternal object will behave as though no node had previously been created in its location with the same node id.
+        */
+        void clear_existing_data(void);
+
+        /*
         * Returns the total size of the files stored in the node in bytes.
         */
         off_t get_node_size();
@@ -188,14 +195,51 @@ class NodeInternal {
         */
         int read_file(const char *filename);
 
+        /*
+        * Checks if there is an error in with the node
+        *
+        * @return
+        *       A nonzero value corresponding to the error detected, or zero if no error is detected
+        *       0 : No Error
+        *       1 : Unknown Error
+        *       2 : An old node was interrupted while manipulating a file. (The data corresponding to this error will be cleared if a file is manipulated, so this should be checked and dealt with immediately after a node has been created.)
+        *       3 : No status information is present. (This will occur if the node has just been created, no files have been manipulated, and there was not preexisting data for the node to find.)
+        *       4 : An old node was interrupted while clearing its data
+        *       5 : An old node was interrupted while changing its status
+        */
+       int check_error(void);
+
+       /*
+       * Returns additional information corresponding to the error number passed in
+       *
+       * This behavior is undefined if the error number is not one listed below, or if the passed error number is not a current error.
+       * 
+       * @return
+       *        Information corresponding to the passed error number
+       *        2 : The path (for the node's functions) of the file whose manipulation was interrupted
+       */
+       char *get_error_info(int error);
+
     private:
         char *get_stored_filename(const char *filename);
 
         std::filesystem::path get_fs_path(const char *filepath);
 
+        void indicate_start_modifying(const char *filename);
+        void indicate_end_modifying(void);
+
     private:
         int node_id;
         char *directory_path;
         size_t storage_skip_amt;
+
+        // Stores whether a file was being manipulated
+        char *status_path;
+
+        // Stores what file was being manipulated
+        char *modifying_path;
+
+        // Quick check for whether a file is being manipulated
+        int cur_modifying;
 
 };
