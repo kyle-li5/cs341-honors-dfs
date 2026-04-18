@@ -193,9 +193,21 @@ class NodeInternal {
 
         std::filesystem::path get_fs_path(const char *filepath);
 
+        void indicate_start_modifying(const char *filename);
+        void indicate_end_modifying(const char *filename);
+
     private:
         int node_id;
         char *directory_path;
         size_t storage_skip_amt;
+
+        // Stores whether a file was being manipulated
+        char *status_path;
+        
+        // Stores what file was being manipulated
+        char *modifying_path;
+
+        // Quick check for whether a file is being manipulated
+        int cur_modifying;
 
 };
