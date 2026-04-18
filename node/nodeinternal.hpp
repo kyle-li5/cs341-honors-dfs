@@ -38,6 +38,8 @@ class NodeInternal {
         off_t get_node_size();
 
         /*
+        * !!! Use contains instead. (contains_file now just calls contains.)
+        *
         * Returns whether or not the node is storing a file with the given filename
         *
         * @param filename
@@ -50,6 +52,18 @@ class NodeInternal {
         int contains_file(const char *filename);
 
         /*
+        * Returns whether or not the node is storing a file or directory with the given filename
+        *
+        * @param path
+        *     Name of the path to check
+        * 
+        * @return
+        *     0 : Item not found
+        *     1 : Item found
+        */
+        int contains(const char *path);
+
+        /*
         * Returns the names of the files stored in the node
         *
         * @return
@@ -60,7 +74,6 @@ class NodeInternal {
         /*
         * Gets the size of the file with the given filename in bytes
         * Undefined for files not currently stored in the node
-        * IMPORTANT - Does not work for directories right now
         *
         * @param filename
         *     Name of the file
@@ -123,6 +136,42 @@ class NodeInternal {
         *     1 : An error occurred
         */
         int delete_file(const char *filename);
+
+        /*
+        * Creates a new directory in the node with the given filename
+        * 
+        * Returns whether or not the directory creation was successful
+        * 
+        * Will return 1 if the directory already exists
+        * 
+        * @param dirname
+        *     Name of the directory to create
+        * 
+        * @return
+        *     0 : No errors were encountered
+        *     1 : An error occurred
+        */
+        int create_directory(const char *dirname);
+
+        /*
+        * Deletes the directory with the given name from the node
+        * 
+        * Fails if the directory is not found
+        * 
+        * @param dirname
+        *     Name of the directory to delete
+        * 
+        * @param delete_contents
+        *     Whether or not to delete all contents of the directory
+        *     If this is 0, delete_directory will fail if the directory is not empty
+        *     0 : False
+        *     1 : True
+        * 
+        * @return
+        *     0 : No errors were encountered
+        *     1 : An error occurred
+        */
+        int delete_directory(const char *dirname, int delete_contents);
 
         /*
         * Returns a file descriptor for reading the contents of the file with the given filename

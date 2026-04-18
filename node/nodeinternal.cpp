@@ -67,7 +67,11 @@ off_t NodeInternal::get_node_size() {
 }
 
 int NodeInternal::contains_file(const char *filename) {
-    return fs::exists(get_fs_path(filename));
+    return contains(filename);
+}
+
+int NodeInternal::contains(const char *path) {
+    return fs::exists(get_fs_path(path));
 }
 
 char **NodeInternal::list_files() {
@@ -103,9 +107,36 @@ char **NodeInternal::list_files() {
     return list;
 }
 
-off_t NodeInternal::get_file_size(const char *filename) { // Later, check if is directory and iterate through if so
-    std::uintmax_t size = fs::file_size(get_fs_path(filename));
-    return (off_t) size;
+off_t NodeInternal::get_file_size(const char *filename) {
+    fs::path fs_path = get_fs_path(filename);
+    if (fs::is_directory(fs_path)) {
+        // sum size of contents
+        off_t size = 0;
+
+        // Create iterator for files
+        fs::recursive_directory_iterator it(fs_path);
+
+        // Define end iterator
+        fs::recursive_directory_iterator end;
+        
+        // Sum sizes
+        for (; it != end; ++it) {
+            if (it->is_regular_file()) {
+                size += it->file_size();
+            }
+        }
+
+        return size;
+
+    } else if (fs::is_regular_file(fs_path)) {
+        // check size normally
+        std::uintmax_t size = fs::file_size(get_fs_path(filename));
+        return (off_t) size;
+
+    } else {
+        // Error
+        return -1;
+    }
 }
 
 int NodeInternal::create_file(const char *filename, int input) {
@@ -114,13 +145,14 @@ int NodeInternal::create_file(const char *filename, int input) {
     }
 
     char *path_str = get_stored_filename(filename);
-    int output = open(path_str, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int output = open(path_str, O_WRONLY | O_CREAT, 0b110110110);
     free(path_str);
 
     char buf[4096];
-    ssize_t bytes_read;
-    while ((bytes_read = read(input, buf, sizeof(buf))) > 0) {
-        write(output, buf, bytes_read);
+    ssize_t read_bytes = 0;
+
+    while ((read_bytes = read(input, buf, 2048)) > 0) {
+        write(output, buf, read_bytes);
     }
 
     close(output);
@@ -137,29 +169,45 @@ int NodeInternal::replace_file(const char *filename, int input) {
     delete_file(filename);
     create_file(filename, input);
 
-    // char *path_str = get_stored_filename(filename);
-    // int output = open(filename, O_WRONLY | O_APPEND);
-    // free(path_str);
-    
-    // char *line = NULL;
-    // size_t len;
-
-    // FILE *src_s = fdopen(input, "r");
-
-    // while (getline(&line, &len, src_s) != -1) {
-    //     dprintf(output, "%s", line);
-    // }
-
-    // fclose(src_s);
-    // free(line);
-    // close(output);
-    // close(input);
-
     return 0;
 }
 
 int NodeInternal::delete_file(const char *filename) {
     return !fs::remove(get_fs_path(filename));
+}
+
+int NodeInternal::create_directory(const char *dirname) {
+    if (contains(dirname)) {
+        return 1;
+    }
+    
+    if (!fs::create_directory(get_fs_path(dirname))) {
+        return 1;
+    }
+
+    return 0;
+}
+
+int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
+    fs::path fs_path = get_fs_path(dirname);
+
+    if (!fs::is_directory(fs_path)) {
+        return 1;
+    }
+
+    if (delete_contents) {
+        std::uintmax_t num_deleted = fs::remove_all(fs_path);
+        if (num_deleted == 0 || num_deleted == (std::uintmax_t) -1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!fs::is_empty(fs_path)) {
+        return 1;
+    }
+
+    return !fs::remove(fs_path);
 }
 
 int NodeInternal::read_file(const char *filename) {
@@ -168,7 +216,7 @@ int NodeInternal::read_file(const char *filename) {
     }
 
     char *path_str = get_stored_filename(filename);
-    int fd = open(filename, O_RDONLY);
+    int fd = open(path_str, O_RDONLY);
     free(path_str);
 
     return fd;
