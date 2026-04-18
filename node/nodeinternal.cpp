@@ -31,6 +31,7 @@ NodeInternal::NodeInternal() {
     // init metadata files
 
     int fd_status = open("./node-data/default/status.dat", O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
+    write(fd_status, "i", 1); // idle
     close(fd_status);
     status_path = realpath("./node-data/default/status.dat", nullptr);
 
@@ -61,6 +62,7 @@ NodeInternal::NodeInternal(int node_id) {
 
     snprintf(buf, 64, "./node-data/%d/status.dat", node_id);
     int fd_status = open(buf, O_WRONLY | O_CREAT | O_TRUNC, 0b110110110);
+    write(fd_status, "i", 1); // idle
     close(fd_status);
     status_path = realpath(buf, nullptr);
 
@@ -166,7 +168,10 @@ off_t NodeInternal::get_file_size(const char *filename) {
 }
 
 int NodeInternal::create_file(const char *filename, int input) {
+    indicate_start_modifying(filename);
+
     if (contains_file(filename)) {
+        indicate_end_modifying();
         return 1;
     }
 
@@ -184,56 +189,76 @@ int NodeInternal::create_file(const char *filename, int input) {
     close(output);
     close(input);
 
+    indicate_end_modifying();
     return 0;
 }
 
 int NodeInternal::replace_file(const char *filename, int input) {
+    indicate_start_modifying(filename);
+
     if (!contains_file(filename)) {
+        indicate_end_modifying();
         return 1;
     }
 
     delete_file(filename);
     create_file(filename, input);
 
+    indicate_end_modifying();
     return 0;
 }
 
 int NodeInternal::delete_file(const char *filename) {
-    return !fs::remove(get_fs_path(filename));
+    indicate_start_modifying(filename);
+    int retval = !fs::remove(get_fs_path(filename));
+    indicate_end_modifying();
+    return retval;
 }
 
 int NodeInternal::create_directory(const char *dirname) {
+    indicate_start_modifying(dirname);
     if (contains(dirname)) {
+        indicate_end_modifying();
         return 1;
     }
     
     if (!fs::create_directory(get_fs_path(dirname))) {
+        indicate_end_modifying();
         return 1;
     }
 
+    indicate_end_modifying();
     return 0;
 }
 
 int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
+    indicate_start_modifying(dirname);
     fs::path fs_path = get_fs_path(dirname);
 
     if (!fs::is_directory(fs_path)) {
+        indicate_end_modifying();
         return 1;
     }
 
     if (delete_contents) {
         std::uintmax_t num_deleted = fs::remove_all(fs_path);
         if (num_deleted == 0 || num_deleted == (std::uintmax_t) -1) {
+            indicate_end_modifying();
             return 1;
         }
+
+        indicate_end_modifying();
         return 0;
     }
 
     if (!fs::is_empty(fs_path)) {
+        indicate_end_modifying();
         return 1;
     }
 
-    return !fs::remove(fs_path);
+    int retval = !fs::remove(fs_path);
+    indicate_end_modifying();
+    return retval;
 }
 
 int NodeInternal::read_file(const char *filename) {
@@ -272,13 +297,28 @@ fs::path NodeInternal::get_fs_path(const char *filename) {
 }
 
 void NodeInternal::indicate_start_modifying(const char *filename) {
-    // if (cur_modifying == 0) {
-        
-    // }
+    if (cur_modifying == 0) {
+        int fd_status = open(status_path, O_WRONLY | O_TRUNC);
+        write(fd_status, "m", 1); // modifying something
+        close(fd_status);
 
-    // ++cur_modifying;
+        int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
+        write(fd_modifying, filename, strlen(filename));
+        close(fd_modifying);
+    }
+
+    ++cur_modifying;
 }
 
-void NodeInternal::indicate_end_modifying(const char *filename) {
+void NodeInternal::indicate_end_modifying(void) {
+    --cur_modifying;
 
+    if (cur_modifying == 0) {
+        int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
+        close(fd_modifying);
+
+        int fd_status = open(status_path, O_WRONLY | O_TRUNC);
+        write(fd_status, "i", 1); // idle
+        close(fd_status);
+    }
 }
