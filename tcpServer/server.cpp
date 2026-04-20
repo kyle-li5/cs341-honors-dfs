@@ -434,6 +434,7 @@ void handle_client(int client_fd, int client_id) {
 int main() {
     signal(SIGINT,  handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGPIPE, SIG_IGN);  // Ignore broken-pipe so writes to dead sockets return -1 instead of killing the process
 
     // Start all storage nodes before accepting client connections.
     // Each node runs in its own background thread on its own port.
