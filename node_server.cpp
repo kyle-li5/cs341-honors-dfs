@@ -31,6 +31,19 @@ void NodeServer::start() {
 // Sets up the TCP listener on NODE_BASE_PORT + node_id, then accepts and
 // handles one connection at a time in a loop.
 void NodeServer::run() {
+    // Check if the node crashed mid-operation last time and clean up before
+    // accepting any connections, so NODE_LIST never returns a corrupt file.
+    int error = local_storage.check_error();
+    if (error == 2 || error == 5) {
+        char *bad_file = local_storage.get_error_info(2);
+        if (bad_file != nullptr) {
+            local_storage.delete_file(bad_file);
+            free(bad_file);
+        }
+    } else if (error == 4) {
+        local_storage.clear_existing_data();
+    }
+
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("node_server socket");

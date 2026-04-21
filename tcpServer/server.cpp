@@ -14,6 +14,7 @@
 // Added to support node routing and distributed storage
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <csignal>
 #include <arpa/inet.h>
@@ -66,6 +67,7 @@ struct FileMetadata {
 };
 
 static std::unordered_map<std::string, FileMetadata> file_metadata_map;
+static std::unordered_set<std::string> pending_uploads;
 static std::mutex metadata_mutex;
 
 // Cycles 0 -> 1 -> 2 -> 0 to spread uploads evenly across nodes
@@ -142,6 +144,55 @@ bool read_exact(int client_fd, char* buffer, size_t size) {
     return true;
 }
 
+// On startup, queries every node via NODE_LIST and rebuilds file_metadata_map
+// so files uploaded in previous sessions are immediately accessible after restart.
+static void rebuild_metadata_from_nodes() {
+    std::lock_guard<std::mutex> lock(metadata_mutex);
+    file_metadata_map.clear();
+
+    for (int node_id = 0; node_id < NUM_NODES; node_id++) {
+        int node_fd = connect_to_node(node_id);
+        if (node_fd < 0) {
+            std::cerr << "[startup] node " << node_id << " unreachable, skipping\n";
+            continue;
+        }
+
+        std::string list_cmd = "NODE_LIST\n";
+        send_all(node_fd, list_cmd.c_str(), list_cmd.size());
+
+        std::string header;
+        if (recv_line(node_fd, header) != 0) {
+            close(node_fd);
+            continue;
+        }
+
+        std::istringstream header_stream(header);
+        std::string tag;
+        int file_count = 0;
+        header_stream >> tag >> file_count;
+
+        for (int i = 0; i < file_count; i++) {
+            std::string file_line;
+            if (recv_line(node_fd, file_line) != 0) { break; }
+
+            std::istringstream line_stream(file_line);
+            std::string filename;
+            size_t filesize = 0;
+            line_stream >> filename >> filesize;
+
+            if (!filename.empty()) {
+                file_metadata_map[filename] = {node_id, filesize};
+                std::cout << "[startup] recovered " << filename
+                          << " on node " << node_id << "\n";
+            }
+        }
+        close(node_fd);
+    }
+
+    std::cout << "[startup] " << file_metadata_map.size()
+              << " file(s) recovered from nodes\n\n";
+}
+
 // Queries each node for its file list and sends a combined listing to the client.
 // Response format: "OK <count>\n" followed by one "<filename> <size>\n" per file.
 // Sending the count first lets the client know exactly how many lines to read.
@@ -180,10 +231,15 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     }
 
     // If the file already exists, send to the same node. Otherwise pick next round-robin.
+    // Also block concurrent uploads of the same filename to prevent orphaned node copies.
     int target_node_id;
     bool is_overwrite = false;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        if (pending_uploads.count(filename)) {
+            send_response(client_fd, "ERROR Upload already in progress for this file");
+            return;
+        }
         auto existing_entry = file_metadata_map.find(filename);
         if (existing_entry != file_metadata_map.end()) {
             target_node_id = existing_entry->second.node_id;
@@ -192,11 +248,14 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
             target_node_id  = next_node_index;
             next_node_index = (next_node_index + 1) % NUM_NODES;
         }
+        pending_uploads.insert(filename);
     }
 
     // Forward the file to the target node
     int node_connection_fd = connect_to_node(target_node_id);
     if (node_connection_fd < 0) {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        pending_uploads.erase(filename);
         send_response(client_fd, "ERROR Could not reach storage node");
         return;
     }
@@ -210,6 +269,8 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     if (recv_line(node_connection_fd, node_response) != 0
             || node_response.substr(0, 2) != "OK") {
         close(node_connection_fd);
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        pending_uploads.erase(filename);
         send_response(client_fd, "ERROR Storage node failed to store file");
         return;
     }
@@ -218,6 +279,7 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     // Record the file location in the metadata map
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        pending_uploads.erase(filename);
         file_metadata_map[filename] = {target_node_id, filesize};
     }
 
@@ -447,6 +509,10 @@ int main() {
 
     // Give nodes a moment to bind their ports before we start accepting clients
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Rebuild the routing map from whatever files are already on the nodes,
+    // so files from previous sessions are immediately accessible after restart.
+    rebuild_metadata_from_nodes();
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
