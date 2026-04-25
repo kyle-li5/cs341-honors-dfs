@@ -229,13 +229,23 @@ void test_rm_fail_with_files_dir(NodeInternal &node, const char *dir_path) {
 void test1node_file_dir(NodeInternal &node) {
     // Assumes empty node
 
+    assert(node.get_node_size() == 0);
+
     test_add_new_file(node, "./node/test-files/bird.ogg", "sound.ogg", 407587);
+    assert(node.get_node_size() == 407587);
+
     test_rm_file(node, "sound.ogg");
+    assert(node.get_node_size() == 0);
+
     test_add_new_file(node, "./node/test-files/bird.ogg", "sound.ogg", 407587);
+    assert(node.get_node_size() == 407587);
 
     test_add_new_dir(node, "pictures-of-salt");
+    assert(node.get_node_size() == 407587);
     test_rm_dir(node, "pictures-of-salt");
+    assert(node.get_node_size() == 407587);
     test_add_new_dir(node, "pictures-of-salt");
+    assert(node.get_node_size() == 407587);
 
     test_add_new_file(node, "./node/test-files/salt.jpg", "pictures-of-salt/salt_a.jpg", 26128322);
     test_add_new_file(node, "./node/test-files/salt.jpg", "pictures-of-salt/salt_b.jpg", 26128322);
@@ -243,8 +253,12 @@ void test1node_file_dir(NodeInternal &node) {
 
     assert(node.get_file_size("pictures-of-salt") == 26128322 * 3);
 
+    assert(node.get_node_size() == 407587 + 26128322 * 3);
+
     test_rm_fail_with_files_dir(node, "pictures-of-salt");
     test_rm_f_dir(node, "pictures-of-salt");
+
+    assert(node.get_node_size() == 407587);
 
     test_add_new_dir(node, "library");
     test_add_new_dir(node, "library/bookshelf");
@@ -264,6 +278,8 @@ void test1node_file_dir(NodeInternal &node) {
 
     test_add_new_file(node, "./node/test-files/war-and-peace.txt", "library/floor/book1.txt", 3293568);
 
+    assert(node.get_node_size() == 407587 + 3293568 * 9);
+
     assert(node.get_file_size("library") == 3293568 * 9);
     assert(node.get_file_size("library/bookshelf") == 3293568 * 5);
     assert(node.get_file_size("library/counter") == 3293568 * 3);
@@ -272,14 +288,22 @@ void test1node_file_dir(NodeInternal &node) {
     test_rm_fail_with_files_dir(node, "library/bookshelf");
     test_rm_f_dir(node, "library/bookshelf");
 
+    assert(node.get_node_size() == 407587 + 3293568 * 4);
+
     test_rm_file(node, "library/floor/book1.txt");
     test_rm_dir(node, "library/floor");
 
     assert(node.get_file_size("library") == 3293568 * 3);
 
+    assert(node.get_node_size() == 407587 + 3293568 * 3);
+
     test_rm_fail_with_files_dir(node, "library");
     test_rm_f_dir(node, "library");
 
+    assert(node.get_node_size() == 407587);
+
     test_rm_file(node, "sound.ogg");
+
+    assert(node.get_node_size() == 0);
 }
 
