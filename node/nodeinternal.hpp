@@ -40,6 +40,18 @@ class NodeInternal {
         void clear_existing_data(void);
 
         /*
+        * Computes the number of bytes in the files stored in the node and returns that value
+        * Also updates bytes_stored to reflect that value
+        * 
+        * get_node_size should usually be used to get this number efficiently, by using the value stored in bytes_stored, unless there is a specific reason why bytes_stored may become inaccurate
+        * (This may need to be called if an error occurs during a file-manipulating function call)
+        * 
+        * @return
+        *     The number total number of bytes stored by the node
+        */
+        off_t compute_node_size();
+
+        /*
         * Returns the total size of the files stored in the node in bytes.
         */
         off_t get_node_size();
@@ -232,6 +244,8 @@ class NodeInternal {
         int node_id;
         char *directory_path;
         size_t storage_skip_amt;
+
+        off_t bytes_stored;
 
         // Stores whether a file was being manipulated
         char *status_path;

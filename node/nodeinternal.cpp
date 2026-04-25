@@ -37,6 +37,8 @@ NodeInternal::NodeInternal() {
     int fd_modifying = open("./node-data/default/modifying.dat", O_WRONLY | O_CREAT, 0b110110110);
     close(fd_modifying);
     modifying_path = realpath("./node-data/default/modifying.dat", nullptr);
+
+    compute_node_size();
 }
 
 NodeInternal::NodeInternal(int node_id) {
@@ -68,6 +70,8 @@ NodeInternal::NodeInternal(int node_id) {
     int fd_modifying = open(buf, O_WRONLY | O_CREAT, 0b110110110);
     close(fd_modifying);
     modifying_path = realpath(buf, nullptr);
+
+    compute_node_size();
 }
 
 void NodeInternal::clear_existing_data(void) {
@@ -84,12 +88,14 @@ void NodeInternal::clear_existing_data(void) {
     fs::remove_all(storage_path);
     fs::create_directory(storage_path);
 
+    compute_node_size();
+
     fd_status = open(status_path, O_WRONLY | O_TRUNC);
     write(fd_status, "i", 1); // idle
     close(fd_status);
 }
 
-off_t NodeInternal::get_node_size() {
+off_t NodeInternal::compute_node_size() {
     off_t size = 0;
 
     // Create iterator for files
@@ -108,7 +114,13 @@ off_t NodeInternal::get_node_size() {
         }
     }
 
+    bytes_stored = size;
+
     return size;
+}
+
+off_t NodeInternal::get_node_size() {
+    return bytes_stored;
 }
 
 int NodeInternal::contains_file(const char *filename) {
@@ -206,6 +218,8 @@ int NodeInternal::create_file(const char *filename, int input) {
     close(output);
     close(input);
 
+    bytes_stored += get_file_size(filename);
+
     indicate_end_modifying();
     return 0;
 }
@@ -227,7 +241,13 @@ int NodeInternal::replace_file(const char *filename, int input) {
 
 int NodeInternal::delete_file(const char *filename) {
     indicate_start_modifying(filename);
+
+    off_t file_size = get_file_size(filename);
     int retval = !fs::remove(get_fs_path(filename));
+    if (retval == 0 && file_size != -1) {
+        bytes_stored -= file_size;
+    }
+
     indicate_end_modifying();
     return retval;
 }
@@ -258,7 +278,10 @@ int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
     }
 
     if (delete_contents) {
+        off_t contents_size = get_file_size(dirname);
         std::uintmax_t num_deleted = fs::remove_all(fs_path);
+        bytes_stored -= contents_size;
+
         if (num_deleted == 0 || num_deleted == (std::uintmax_t) -1) {
             indicate_end_modifying();
             return 1;
