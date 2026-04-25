@@ -41,7 +41,7 @@ namespace fs = std::filesystem;
             }
 
 #define SET_SEED() { \
-                seed = time(NULL); \
+                seed = time(NULL) + node_id; \
             }
 
 #else
