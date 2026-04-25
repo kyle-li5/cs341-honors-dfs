@@ -3,3 +3,7 @@ a.out
 node-data
 .DS_Store
 *.pch
+build
+client
+server
+node-test
