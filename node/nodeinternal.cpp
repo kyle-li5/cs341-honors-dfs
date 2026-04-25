@@ -15,7 +15,49 @@ namespace fs = std::filesystem;
 
 
 
+// #define RANDOM_FAILURES
+
+#ifdef RANDOM_FAILURES
+
+#include <time.h>
+#define CALL_FAILURE_RATE 10000
+#define LOOP_FAILURE_RATE 1000000
+
+// Takes an unsigned int rate
+#define RANDOM_FAIL(rate) { \
+                ++fail_calls; \
+                if (rand_r(&seed) % rate == 0) { \
+                    /* dprintf(2, "Exited thread after %llu failure calls\n", fail_calls); */ \
+                    pthread_exit(NULL); \
+                } \
+            }
+
+#define CALL_FAIL() { \
+                RANDOM_FAIL(CALL_FAILURE_RATE); \
+            }
+
+#define LOOP_FAIL() { \
+                RANDOM_FAIL(LOOP_FAILURE_RATE); \
+            }
+
+#define SET_SEED() { \
+                seed = time(NULL); \
+            }
+
+#else
+
+#define RANDOM_FAIL(rate) {}
+#define CALL_FAIL() {}
+#define LOOP_FAIL() {}
+#define SET_SEED() {}
+
+#endif
+
+
+
 NodeInternal::NodeInternal() {
+    SET_SEED();
+
     node_id = -1;
 
     fs::create_directory(fs::path("./node-data"));
@@ -42,6 +84,8 @@ NodeInternal::NodeInternal() {
 }
 
 NodeInternal::NodeInternal(int node_id) {
+    SET_SEED();
+
     this->node_id = node_id;
 
     char buf[64];
@@ -75,6 +119,8 @@ NodeInternal::NodeInternal(int node_id) {
 }
 
 void NodeInternal::clear_existing_data(void) {
+    CALL_FAIL();
+
     int fd_status = open(status_path, O_WRONLY | O_TRUNC);
     write(fd_status, "c", 1); // clearing node
     close(fd_status);
@@ -86,6 +132,9 @@ void NodeInternal::clear_existing_data(void) {
     snprintf(buf, 256, "%s/storage", directory_path);
     fs::path storage_path = fs::path(buf);
     fs::remove_all(storage_path);
+
+    CALL_FAIL();
+
     fs::create_directory(storage_path);
 
     compute_node_size();
@@ -98,6 +147,8 @@ void NodeInternal::clear_existing_data(void) {
 off_t NodeInternal::compute_node_size() {
     off_t size = 0;
 
+    CALL_FAIL();
+
     // Create iterator for files
     char storage_path[PATH_MAX];
     snprintf(storage_path, PATH_MAX, "%s/storage", directory_path);
@@ -109,6 +160,7 @@ off_t NodeInternal::compute_node_size() {
     
     // Sum sizes
     for (; it != end; ++it) {
+        LOOP_FAIL();
         if (it->is_regular_file()) {
             size += it->file_size();
         }
@@ -120,18 +172,22 @@ off_t NodeInternal::compute_node_size() {
 }
 
 off_t NodeInternal::get_node_size() {
+    LOOP_FAIL();
     return bytes_stored;
 }
 
 int NodeInternal::contains_file(const char *filename) {
+    LOOP_FAIL();
     return contains(filename);
 }
 
 int NodeInternal::contains(const char *path) {
+    LOOP_FAIL();
     return fs::exists(get_fs_path(path));
 }
 
 char **NodeInternal::list_files() {
+    CALL_FAIL();
     std::vector<fs::path> file_paths;
 
     // Create iterator for files
@@ -145,6 +201,7 @@ char **NodeInternal::list_files() {
     
     // Collect all file paths
     for (; it != end; ++it) {
+        LOOP_FAIL();
         if (it->is_regular_file()) {
             file_paths.push_back(it->path());
         }
@@ -157,6 +214,9 @@ char **NodeInternal::list_files() {
         const char *orig = file_paths[i].c_str();
         size_t orig_len = strlen(orig);
         size_t amt_to_cpy = orig_len - storage_skip_amt;
+
+        LOOP_FAIL();
+
         list[i] = (char*) malloc(amt_to_cpy + 1);
         strncpy(list[i], orig + storage_skip_amt, amt_to_cpy + 1);
     }
@@ -165,6 +225,8 @@ char **NodeInternal::list_files() {
 }
 
 off_t NodeInternal::get_file_size(const char *filename) {
+    LOOP_FAIL();
+
     fs::path fs_path = get_fs_path(filename);
     if (fs::is_directory(fs_path)) {
         // sum size of contents
@@ -178,6 +240,7 @@ off_t NodeInternal::get_file_size(const char *filename) {
         
         // Sum sizes
         for (; it != end; ++it) {
+            LOOP_FAIL();
             if (it->is_regular_file()) {
                 size += it->file_size();
             }
@@ -197,6 +260,8 @@ off_t NodeInternal::get_file_size(const char *filename) {
 }
 
 int NodeInternal::create_file(const char *filename, int input) {
+    CALL_FAIL();
+
     indicate_start_modifying(filename);
 
     if (contains_file(filename)) {
@@ -212,6 +277,7 @@ int NodeInternal::create_file(const char *filename, int input) {
     ssize_t read_bytes = 0;
 
     while ((read_bytes = read(input, buf, 2048)) > 0) {
+        LOOP_FAIL();
         write(output, buf, read_bytes);
     }
 
@@ -226,6 +292,8 @@ int NodeInternal::create_file(const char *filename, int input) {
 
 int NodeInternal::replace_file(const char *filename, int input) {
     indicate_start_modifying(filename);
+
+    CALL_FAIL();
 
     if (!contains_file(filename)) {
         indicate_end_modifying();
@@ -248,6 +316,8 @@ int NodeInternal::delete_file(const char *filename) {
         bytes_stored -= file_size;
     }
 
+    CALL_FAIL();
+
     indicate_end_modifying();
     return retval;
 }
@@ -258,6 +328,8 @@ int NodeInternal::create_directory(const char *dirname) {
         indicate_end_modifying();
         return 1;
     }
+
+    CALL_FAIL();
     
     if (!fs::create_directory(get_fs_path(dirname))) {
         indicate_end_modifying();
@@ -276,6 +348,8 @@ int NodeInternal::delete_directory(const char *dirname, int delete_contents) {
         indicate_end_modifying();
         return 1;
     }
+
+    CALL_FAIL();
 
     if (delete_contents) {
         off_t contents_size = get_file_size(dirname);
@@ -308,6 +382,7 @@ int NodeInternal::read_file(const char *filename) {
 
     char *path_str = get_stored_filename(filename);
     int fd = open(path_str, O_RDONLY);
+    CALL_FAIL();
     free(path_str);
 
     return fd;
@@ -315,6 +390,9 @@ int NodeInternal::read_file(const char *filename) {
 
 NodeInternal::~NodeInternal() {
     free(directory_path);
+
+    CALL_FAIL();
+
     free(status_path);
     free(modifying_path);
 }
@@ -322,6 +400,8 @@ NodeInternal::~NodeInternal() {
 
 
 int NodeInternal::check_error(void) {
+    CALL_FAIL();
+
     int fd_status = open(status_path, O_RDONLY);
     char buf[1];
     ssize_t bytes_read = read(fd_status, buf, 1);
@@ -357,6 +437,8 @@ char *NodeInternal::get_error_info(int error) {
     int fd_modifying;
     ssize_t bytes_read;
 
+    CALL_FAIL();
+
     switch (error) {
         case 2:
             fd_modifying = open(modifying_path, O_RDONLY);
@@ -375,12 +457,16 @@ char *NodeInternal::get_error_info(int error) {
 
 
 char *NodeInternal::get_stored_filename(const char *filename) {
+    LOOP_FAIL();
+
     char *path = (char*) malloc(PATH_MAX);
     snprintf(path, PATH_MAX, "%s/storage/%s", directory_path, filename);
     return path;
 }
 
 fs::path NodeInternal::get_fs_path(const char *filename) {
+    LOOP_FAIL();
+
     char *str_path = get_stored_filename(filename);
     fs::path fs_path = fs::path(str_path);
     free(str_path);
@@ -393,6 +479,8 @@ void NodeInternal::indicate_start_modifying(const char *filename) {
         write(fd_status, "t", 1); // transitioning status
         close(fd_status);
 
+        LOOP_FAIL();
+
         int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
         write(fd_modifying, filename, strlen(filename));
         close(fd_modifying);
@@ -402,16 +490,22 @@ void NodeInternal::indicate_start_modifying(const char *filename) {
         close(fd_status);
     }
 
+    LOOP_FAIL();
+
     ++cur_modifying;
 }
 
 void NodeInternal::indicate_end_modifying(void) {
     --cur_modifying;
 
+    LOOP_FAIL();
+
     if (cur_modifying == 0) {
         int fd_status = open(status_path, O_WRONLY | O_TRUNC);
         write(fd_status, "t", 1); // transitioning status
         close(fd_status);
+
+        LOOP_FAIL();
 
         int fd_modifying = open(modifying_path, O_WRONLY | O_TRUNC);
         close(fd_modifying);
