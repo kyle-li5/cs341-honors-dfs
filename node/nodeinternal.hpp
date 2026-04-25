@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <filesystem>
 
+// #define RANDOM_FAILURES
+
 class NodeInternal {
     public:
         /*
@@ -255,5 +257,10 @@ class NodeInternal {
 
         // Quick check for whether a file is being manipulated
         int cur_modifying;
+
+        #ifdef RANDOM_FAILURES
+            unsigned seed;
+            long long unsigned fail_calls = 0;
+        #endif
 
 };
