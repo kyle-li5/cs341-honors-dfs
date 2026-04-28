@@ -20,7 +20,7 @@ DEPS = $(SERVER_OBJS:.o=.d) $(CLIENT_OBJS:.o=.d) \
        $(NODETEST_OBJS:.o=.d) $(MANAGER_OBJS:.o=.d)
 
 # ── primary targets ───────────────────────────────────────────────────────────
-.PHONY: all server client node-test manager clean test test-edge run-server run-client
+.PHONY: all server client node-test manager clean test test-edge run-server run-client tui run-tui
 
 all: server client
 
@@ -51,6 +51,12 @@ run-server: server
 
 run-client: client
 	./client localhost
+
+tui:
+	pip install --quiet textual
+
+run-tui: tui
+	python3 dfs_tui.py
 
 test: server
 	python3 testing/test_client.py
