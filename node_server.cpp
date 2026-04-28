@@ -199,6 +199,11 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         } else {
             store_result = local_storage.create_file(filename.c_str(), pipe_fds[0]);
         }
+        // A failed op can leave NodeInternal's cached byte total drifted —
+        // recompute it so subsequent NODE_STATUS queries stay accurate.
+        if (store_result != 0) {
+            local_storage.compute_node_size();
+        }
     }
     close(pipe_fds[0]);
 
@@ -263,6 +268,9 @@ void NodeServer::handle_delete(int connection_fd, const std::string &filename) {
     {
         std::lock_guard<std::mutex> lock(storage_mutex);
         delete_result = local_storage.delete_file(filename.c_str());
+        if (delete_result != 0) {
+            local_storage.compute_node_size();
+        }
     }
 
     if (delete_result != 0) {
