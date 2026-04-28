@@ -13,6 +13,7 @@
 
 // Added to support node routing and distributed storage
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
@@ -70,8 +71,23 @@ static std::unordered_map<std::string, FileMetadata> file_metadata_map;
 static std::unordered_set<std::string> pending_uploads;
 static std::mutex metadata_mutex;
 
-// Cycles 0 -> 1 -> 2 -> 0 to spread uploads evenly across nodes
-static int next_node_index = 0;
+// Per-node byte totals, indexed by node_id. Protected by metadata_mutex.
+// Kept alongside node_min_heap so we can find the old size in O(1) when
+// updating a node's heap entry.
+static off_t node_bytes[NUM_NODES] = {};
+
+// Min-heap over (bytes_stored, node_id). std::set keeps the smallest entry
+// at begin(), so picking the least-loaded node is O(1). Updates are O(log N).
+// Protected by metadata_mutex.
+static std::set<std::pair<off_t, int>> node_min_heap;
+
+// Adjusts node_id's stored-byte count by delta and repositions it in the heap.
+// Must be called while holding metadata_mutex.
+static void update_node_size(int node_id, off_t delta) {
+    node_min_heap.erase({node_bytes[node_id], node_id});
+    node_bytes[node_id] += delta;
+    node_min_heap.insert({node_bytes[node_id], node_id});
+}
 
 // Global listen fd so the signal handler can close it on Ctrl+C
 static int server_listen_fd = -1;
@@ -149,6 +165,8 @@ bool read_exact(int client_fd, char* buffer, size_t size) {
 static void rebuild_metadata_from_nodes() {
     std::lock_guard<std::mutex> lock(metadata_mutex);
     file_metadata_map.clear();
+    std::fill(node_bytes, node_bytes + NUM_NODES, 0);
+    node_min_heap.clear();
 
     for (int node_id = 0; node_id < NUM_NODES; node_id++) {
         int node_fd = connect_to_node(node_id);
@@ -182,11 +200,17 @@ static void rebuild_metadata_from_nodes() {
 
             if (!filename.empty()) {
                 file_metadata_map[filename] = {node_id, filesize};
+                node_bytes[node_id] += (off_t)filesize;
                 std::cout << "[startup] recovered " << filename
                           << " on node " << node_id << "\n";
             }
         }
         close(node_fd);
+    }
+
+    // Build the heap from the recovered per-node totals.
+    for (int i = 0; i < NUM_NODES; i++) {
+        node_min_heap.insert({node_bytes[i], i});
     }
 
     std::cout << "[startup] " << file_metadata_map.size()
@@ -212,7 +236,8 @@ void handle_list(int client_fd, int client_id) {
 }
 
 // Receives the file from the client then forwards it to a storage node.
-// Picks the next node round-robin, or reuses the same node if the file already exists.
+// Always picks the least-loaded node from the min-heap, even on overwrite,
+// so a file that grows substantially can migrate off an over-loaded node.
 void handle_upload(int client_fd, int client_id, const std::string& filename, size_t filesize) {
     std::cout << "[Client " << client_id << "] UPLOAD " << filename
               << " (" << filesize << " bytes)\n";
@@ -230,10 +255,14 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         return;
     }
 
-    // If the file already exists, send to the same node. Otherwise pick next round-robin.
-    // Also block concurrent uploads of the same filename to prevent orphaned node copies.
-    int target_node_id;
-    bool is_overwrite = false;
+    // Pick the target node and *reserve* its bytes immediately so concurrent
+    // uploads see the updated load and don't all stampede onto the same node.
+    // Also block concurrent uploads of the same filename to prevent orphaned
+    // node copies.
+    int    target_node_id;
+    bool   is_overwrite = false;
+    int    old_node_id  = -1;
+    size_t old_size     = 0;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         if (pending_uploads.count(filename)) {
@@ -242,12 +271,12 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         }
         auto existing_entry = file_metadata_map.find(filename);
         if (existing_entry != file_metadata_map.end()) {
-            target_node_id = existing_entry->second.node_id;
-            is_overwrite   = true;
-        } else {
-            target_node_id  = next_node_index;
-            next_node_index = (next_node_index + 1) % NUM_NODES;
+            is_overwrite = true;
+            old_node_id  = existing_entry->second.node_id;
+            old_size     = existing_entry->second.filesize;
         }
+        target_node_id = node_min_heap.begin()->second;          // O(1)
+        update_node_size(target_node_id, (off_t)filesize);       // reserve
         pending_uploads.insert(filename);
     }
 
@@ -255,6 +284,7 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     int node_connection_fd = connect_to_node(target_node_id);
     if (node_connection_fd < 0) {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
         pending_uploads.erase(filename);
         send_response(client_fd, "ERROR Could not reach storage node");
         return;
@@ -270,17 +300,47 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
             || node_response.substr(0, 2) != "OK") {
         close(node_connection_fd);
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
         pending_uploads.erase(filename);
         send_response(client_fd, "ERROR Storage node failed to store file");
         return;
     }
     close(node_connection_fd);
 
-    // Record the file location in the metadata map
+    // If this was an overwrite that landed on a different node, the old copy
+    // is now orphaned — tell the old node to delete it. If the old node is
+    // unreachable or refuses, we log it but still commit the new metadata
+    // (the new copy is the source of truth). The orphan would need manual
+    // cleanup; startup recovery does not currently detect cross-node duplicates.
+    if (is_overwrite && old_node_id != target_node_id) {
+        bool orphan_cleaned = false;
+        int  old_node_fd    = connect_to_node(old_node_id);
+        if (old_node_fd >= 0) {
+            std::string delete_cmd = "NODE_DELETE " + filename + "\n";
+            send_all(old_node_fd, delete_cmd.c_str(), delete_cmd.size());
+            std::string old_response;
+            if (recv_line(old_node_fd, old_response) == 0
+                    && old_response.substr(0, 2) == "OK") {
+                orphan_cleaned = true;
+            }
+            close(old_node_fd);
+        }
+        if (!orphan_cleaned) {
+            std::cerr << "[warn] orphan copy of " << filename
+                      << " left on node " << old_node_id
+                      << " after migration to node " << target_node_id << "\n";
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
-        pending_uploads.erase(filename);
+        if (is_overwrite) {
+            // Release the old file's bytes from whichever node held it.
+            // If old_node == target, this nets against part of our reservation.
+            update_node_size(old_node_id, -(off_t)old_size);
+        }
         file_metadata_map[filename] = {target_node_id, filesize};
+        pending_uploads.erase(filename);
     }
 
     if (is_overwrite) {
@@ -382,6 +442,7 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
 
     if (node_response.substr(0, 2) == "OK") {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        update_node_size(target_node_id, -(off_t)file_metadata_map[filename].filesize);
         file_metadata_map.erase(filename);
         send_response(client_fd, "OK File deleted");
     } else {
