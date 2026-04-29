@@ -62,7 +62,7 @@ std::atomic<int> client_count(0);
 std::mutex print_mutex;
 
 // define constants for chunking
-const size_t CHUNK_SIZE = 64*1024*1024;
+const size_t CHUNK_SIZE = 64*1024; // 64 kb
 const int NUM_REDUNDANCIES = 3;
 
 struct ChunkMetadata {
