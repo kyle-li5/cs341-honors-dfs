@@ -31,7 +31,7 @@ This document outlines the technologies, libraries, and tools used in this Distr
 - `<assert.h>` — Assertion macros for unit tests
 
 ### POSIX / Unix System Headers
-- `<sys/socket.h>`, `<netinet/in.h>` — TCP socket operations
+- `<sys/socket.h>`, `<netinet/in.h>`, `<arpa/inet.h>` — TCP socket operations
 - `<sys/stat.h>` — File status information
 - `<unistd.h>` — POSIX API (`read`, `write`, `close`)
 - `<fcntl.h>` — File control (`O_RDONLY`, `O_WRONLY`, `O_CREAT`)

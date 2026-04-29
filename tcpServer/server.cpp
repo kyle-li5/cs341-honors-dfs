@@ -14,6 +14,7 @@
 // Added to support node routing and distributed storage
 #include <mutex>
 #include <set>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
@@ -60,12 +61,27 @@ std::atomic<int> client_count(0);
 // Shared mutex so concurrent threads don't interleave their console output
 std::mutex print_mutex;
 
-// Tracks which node a file lives on and how large it is.
-// The server uses this to route DOWNLOAD and DELETE to the right node.
-struct FileMetadata {
-    int    node_id;
-    size_t filesize;
+// define constants for chunking
+const size_t CHUNK_SIZE = 64*1024*1024;
+const int NUM_REDUNDANCIES = 3;
+
+struct ChunkMetadata {
+    int chunk_index;
+    size_t size;
+    std::vector<int> redundancy_ids;
 };
+
+struct FileMetadata {
+    size_t total_size;
+    std::vector<ChunkMetadata> chunks;
+};
+
+// // Tracks which node a file lives on and how large it is.
+// // The server uses this to route DOWNLOAD and DELETE to the right node.
+// struct FileMetadata {
+//     int    node_id;
+//     size_t filesize;
+// };
 
 static std::unordered_map<std::string, FileMetadata> file_metadata_map;
 static std::unordered_set<std::string> pending_uploads;
@@ -168,6 +184,9 @@ static void rebuild_metadata_from_nodes() {
     std::fill(node_bytes, node_bytes + NUM_NODES, 0);
     node_min_heap.clear();
 
+    // uses an intermediate map to map filenames to ordered map of chunks, which automatically sorts by chunk_index
+    std::unordered_map<std::string, std::map<int, ChunkMetadata>> temp_map;
+
     for (int node_id = 0; node_id < NUM_NODES; node_id++) {
         int node_fd = connect_to_node(node_id);
         if (node_fd < 0) {
@@ -199,13 +218,34 @@ static void rebuild_metadata_from_nodes() {
             line_stream >> filename >> filesize;
 
             if (!filename.empty()) {
-                file_metadata_map[filename] = {node_id, filesize};
+                size_t chunk_pos = filename.rfind("_chunk");
+                if (chunk_pos != std::string::npos) {
+                    std::string original_filename = filename.substr(0, chunk_pos);
+                    int chunk_index = std::stoi(filename.substr(chunk_pos + 6));
+
+                    temp_map[original_filename][chunk_index].chunk_index = chunk_index;
+                    temp_map[original_filename][chunk_index].size = filesize;
+                    temp_map[original_filename][chunk_index].redundancy_ids.push_back(node_id);
+                }
+
                 node_bytes[node_id] += (off_t)filesize;
-                std::cout << "[startup] recovered " << filename
-                          << " on node " << node_id << "\n";
             }
         }
         close(node_fd);
+    }
+
+    for (auto const& [filename, chunks_map] : temp_map) {
+        FileMetadata file_metadata;
+        file_metadata.total_size = 0;
+
+        for (auto const& [index, chunk_metadata] : chunks_map) {
+            file_metadata.chunks.push_back(chunk_metadata);
+            file_metadata.total_size += chunk_metadata.size;
+        }
+
+        file_metadata_map[filename] = file_metadata;
+        std::cout << "[startup] recovered " << filename
+                    << " (" << file_metadata.total_size << "bytes)\n";
     }
 
     // Build the heap from the recovered per-node totals.
@@ -230,7 +270,7 @@ void handle_list(int client_fd, int client_id) {
 
     for (auto &entry : file_metadata_map) {
         std::string file_line = entry.first + " "
-                                + std::to_string(entry.second.filesize) + "\n";
+                                + std::to_string(entry.second.total_size) + "\n";
         send_all(client_fd, file_line.c_str(), file_line.size());
     }
 }
@@ -238,6 +278,7 @@ void handle_list(int client_fd, int client_id) {
 // Receives the file from the client then forwards it to a storage node.
 // Always picks the least-loaded node from the min-heap, even on overwrite,
 // so a file that grows substantially can migrate off an over-loaded node.
+
 void handle_upload(int client_fd, int client_id, const std::string& filename, size_t filesize) {
     std::cout << "[Client " << client_id << "] UPLOAD " << filename
               << " (" << filesize << " bytes)\n";
@@ -248,21 +289,12 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         return;
     }
 
-    // Receive file bytes from the client into a buffer
-    std::vector<char> file_buffer(filesize);
-    if (!read_exact(client_fd, file_buffer.data(), filesize)) {
-        send_response(client_fd, "ERROR Connection lost during upload");
-        return;
-    }
-
     // Pick the target node and *reserve* its bytes immediately so concurrent
     // uploads see the updated load and don't all stampede onto the same node.
     // Also block concurrent uploads of the same filename to prevent orphaned
     // node copies.
-    int    target_node_id;
-    bool   is_overwrite = false;
-    int    old_node_id  = -1;
-    size_t old_size     = 0;
+    bool is_overwrite = false;
+    FileMetadata old_file_metadata;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         if (pending_uploads.count(filename)) {
@@ -272,74 +304,146 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         auto existing_entry = file_metadata_map.find(filename);
         if (existing_entry != file_metadata_map.end()) {
             is_overwrite = true;
-            old_node_id  = existing_entry->second.node_id;
-            old_size     = existing_entry->second.filesize;
+            old_file_metadata = existing_entry->second;
         }
-        target_node_id = node_min_heap.begin()->second;          // O(1)
-        update_node_size(target_node_id, (off_t)filesize);       // reserve
         pending_uploads.insert(filename);
     }
 
-    // Forward the file to the target node
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
-        std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
-        pending_uploads.erase(filename);
-        send_response(client_fd, "ERROR Could not reach storage node");
-        return;
-    }
+    FileMetadata file_metadata;
+    file_metadata.total_size = filesize;
+    size_t bytes_read = 0;
+    int chunk_index = 0;
 
-    std::string store_command = "NODE_STORE " + filename + " "
-                               + std::to_string(filesize) + "\n";
-    send_all(node_connection_fd, store_command.c_str(), store_command.size());
-    send_all(node_connection_fd, file_buffer.data(), filesize);
+    while (bytes_read < filesize) {
+        size_t curr_chunk_size = std::min(CHUNK_SIZE, filesize - bytes_read);
 
-    std::string node_response;
-    if (recv_line(node_connection_fd, node_response) != 0
-            || node_response.substr(0, 2) != "OK") {
+        // Receive file bytes from the client into a buffer
+        std::vector<char> chunk_buff(curr_chunk_size);
+        if (!read_exact(client_fd, chunk_buff.data(), curr_chunk_size)) {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            pending_uploads.erase(filename);
+            send_response(client_fd, "ERROR Connection lost during upload");
+            return;
+        }
+
+        std::vector<int> chosen_nodes;
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            for (int i = 0; i < NUM_REDUNDANCIES && !node_min_heap.empty(); ++i) {
+                int target_node_id = node_min_heap.begin()->second;
+                chosen_nodes.push_back(target_node_id);
+                node_min_heap.erase(node_min_heap.begin());
+            }
+            for (int node_id : chosen_nodes) {
+                node_bytes[node_id] += curr_chunk_size;
+                node_min_heap.insert({node_bytes[node_id], node_id});
+            }
+        }
+
+        // check if there are any successful connections to nodes, first successful connection is head node for redundancies
+        int node_connection_fd = -1;
+        size_t head_index = 0;
+
+        for (; head_index < chosen_nodes.size(); ++head_index) {
+            node_connection_fd = connect_to_node(chosen_nodes[head_index]);
+
+            if (node_connection_fd >= 0) {
+                break;
+            }
+            std::cerr << "ERROR Failed to connect to node " + std::to_string(chosen_nodes[head_index]) + ", attempting next node...\n";
+            {
+                std::lock_guard<std::mutex> lock(metadata_mutex);
+                update_node_size(chosen_nodes[head_index], -(off_t)curr_chunk_size); // undo reservation
+            }
+        }
+
+        if (node_connection_fd < 0) {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            pending_uploads.erase(filename);
+            send_response(client_fd, "ERROR Cannot upload file, all chosen nodes are offline");
+            return;
+        }
+        
+        std::string chunk_filename = filename + "_chunk" + std::to_string(chunk_index);
+        std::string store_command = "NODE_STORE " + chunk_filename + " " + std::to_string(curr_chunk_size);
+
+        // logic for pipelining redundancy logic so it pushes to all chosen nodes at the same time
+        int remaining_redundancy_nodes = chosen_nodes.size() - 1 - head_index;
+        if (remaining_redundancy_nodes > 0) { 
+            store_command += " " + std::to_string(remaining_redundancy_nodes);
+            for (size_t i = head_index + 1; i < chosen_nodes.size(); ++i) {
+                store_command += " " + std::to_string(chosen_nodes[i]);
+            }
+        }
+        store_command += "\n";
+
+        // send to head node
+        send_all(node_connection_fd, store_command.c_str(), store_command.size());
+        send_all(node_connection_fd, chunk_buff.data(), curr_chunk_size);
+
+        std::string node_response;
+        recv_line(node_connection_fd, node_response);
         close(node_connection_fd);
-        std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
-        pending_uploads.erase(filename);
-        send_response(client_fd, "ERROR Storage node failed to store file");
-        return;
+
+        // only record nodes that were successfully connected to
+        std::vector<int> successful_redundacies(chosen_nodes.begin() + head_index, chosen_nodes.end());
+
+        ChunkMetadata chunk_metadata;
+        chunk_metadata.chunk_index = chunk_index;
+        chunk_metadata.size = curr_chunk_size;
+        chunk_metadata.redundancy_ids = successful_redundacies;
+        file_metadata.chunks.push_back(chunk_metadata);
+
+        bytes_read += curr_chunk_size;
+        chunk_index++;
     }
-    close(node_connection_fd);
 
     // If this was an overwrite that landed on a different node, the old copy
     // is now orphaned — tell the old node to delete it. If the old node is
     // unreachable or refuses, we log it but still commit the new metadata
     // (the new copy is the source of truth). The orphan would need manual
     // cleanup; startup recovery does not currently detect cross-node duplicates.
-    if (is_overwrite && old_node_id != target_node_id) {
-        bool orphan_cleaned = false;
-        int  old_node_fd    = connect_to_node(old_node_id);
-        if (old_node_fd >= 0) {
-            std::string delete_cmd = "NODE_DELETE " + filename + "\n";
-            send_all(old_node_fd, delete_cmd.c_str(), delete_cmd.size());
-            std::string old_response;
-            if (recv_line(old_node_fd, old_response) == 0
-                    && old_response.substr(0, 2) == "OK") {
-                orphan_cleaned = true;
+    if (is_overwrite) {
+        for (const auto& old_chunk : old_file_metadata.chunks) {
+            std::string old_chunk_name = filename + "_chunk" + std::to_string(old_chunk.chunk_index);
+            
+            for (int old_node_id : old_chunk.redundancy_ids) {
+                bool orphan_cleaned = false;
+                int  old_node_fd = connect_to_node(old_node_id);
+
+                if (old_node_fd >= 0) {
+                    std::string delete_cmd = "NODE_DELETE " + old_chunk_name + "\n";
+                    send_all(old_node_fd, delete_cmd.c_str(), delete_cmd.size());
+
+                    std::string old_response;
+                    if (recv_line(old_node_fd, old_response) == 0
+                            && old_response.substr(0, 2) == "OK") {
+                        orphan_cleaned = true;
+                    }
+                    close(old_node_fd);
+                }
+
+                if (!orphan_cleaned) {
+                    std::cerr << "[warn] orphan copy of " << old_chunk_name
+                            << " left on node " << old_node_id << "\n";
+                }
             }
-            close(old_node_fd);
-        }
-        if (!orphan_cleaned) {
-            std::cerr << "[warn] orphan copy of " << filename
-                      << " left on node " << old_node_id
-                      << " after migration to node " << target_node_id << "\n";
         }
     }
 
+    // commit file metadata to map
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         if (is_overwrite) {
             // Release the old file's bytes from whichever node held it.
             // If old_node == target, this nets against part of our reservation.
-            update_node_size(old_node_id, -(off_t)old_size);
+            for (const auto& old_chunk : old_file_metadata.chunks) {
+                for (int old_node_id : old_chunk.redundancy_ids) {
+                    update_node_size(old_node_id, -(off_t)old_chunk.size); // undo reservation
+                }
+            }
         }
-        file_metadata_map[filename] = {target_node_id, filesize};
+        file_metadata_map[filename] = file_metadata;
         pending_uploads.erase(filename);
     }
 
@@ -349,15 +453,15 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         send_response(client_fd, "OK File uploaded successfully");
     }
 
-    std::cout << "[Client " << client_id << "] Upload complete: " << filename
-              << " -> node " << target_node_id << "\n";
+    std::cout << "[Client " << client_id << "] Upload complete: " << filename << "\n";
+
 }
 
 // Looks up which node has the file, retrieves it, and streams it to the client.
 void handle_download(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DOWNLOAD " << filename << "\n";
 
-    int target_node_id;
+    FileMetadata file_metadata;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         auto entry = file_metadata_map.find(filename);
@@ -365,49 +469,78 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
             send_response(client_fd, "ERROR File not found");
             return;
         }
-        target_node_id = entry->second.node_id;
+        file_metadata = entry->second;
     }
 
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
-        send_response(client_fd, "ERROR Could not reach storage node");
-        return;
+    // handle if missing any chunk of file -> return error immediately
+    // loop through file_metadata chunks, they were put in order by the temp map used earlier
+    int expected_index = 0;
+    for (const auto& chunk : file_metadata.chunks) {
+        if (chunk.chunk_index != expected_index) {
+            send_response(client_fd, "ERROR File corrupted: missing chunk " + std::to_string(expected_index));
+            return;
+        }
+        if (chunk.redundancy_ids.empty()) {
+            send_response(client_fd, "ERROR No nodes found for chunk " + std::to_string(expected_index));
+            return;
+        }
+        expected_index++;
     }
 
-    std::string retrieve_command = "NODE_RETRIEVE " + filename + "\n";
-    send_all(node_connection_fd, retrieve_command.c_str(), retrieve_command.size());
+    // send client total size
+    send_response(client_fd, "OK " + std::to_string(file_metadata.total_size));
 
-    // Node responds with "FILE <filename> <filesize>\n<bytes>"
-    std::string node_response;
-    if (recv_line(node_connection_fd, node_response) != 0) {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR Node disconnected");
-        return;
+    for (const auto& chunk : file_metadata.chunks) {
+        std::string chunk_filename = filename + "_chunk" + std::to_string(chunk.chunk_index);
+        bool chunk_retrieved = false;
+
+        for (int target_node_id : chunk.redundancy_ids) {
+            int node_connection_fd = connect_to_node(target_node_id);
+            if (node_connection_fd < 0) {
+                continue; // node offline, try next node
+            }
+
+            std::string retrieve_command = "NODE_RETRIEVE " + chunk_filename + "\n";
+            send_all(node_connection_fd, retrieve_command.c_str(), retrieve_command.size());
+
+            // Node responds with "FILE <filename> <filesize>\n<bytes>"
+            std::string node_response;
+            if (recv_line(node_connection_fd, node_response) != 0) {
+                close(node_connection_fd);
+                continue; // connection failed during read, try next node
+            }
+
+            if (node_response.substr(0, 4) != "FILE") {
+                close(node_connection_fd);
+                continue; // node error, try next node
+            }
+
+            // Parse "FILE <filename> <filesize>"
+            std::istringstream response_stream(node_response);
+            std::string tag, received_filename;
+            size_t received_filesize;
+            response_stream >> tag >> received_filename >> received_filesize;
+
+            std::vector<char> file_buffer(received_filesize);
+            if (recv_file_data(node_connection_fd, received_filesize, file_buffer.data()) != 0) {
+                close(node_connection_fd);
+                continue; // cannot read file from node, try next node
+            }
+            close(node_connection_fd);
+
+            // Send OK with filesize so client knows how many bytes to read
+            send(client_fd, file_buffer.data(), received_filesize, 0);
+            
+            chunk_retrieved = true;
+            break; // successfully retrieved current chunk
+        }
+
+        // chunk not found, data is lost
+        if (!chunk_retrieved) {
+            std::cerr << "ERROR Failed to retrieve chunk " << chunk.chunk_index << " for file " << filename << ", all nodes are down\n";
+            send_response(client_fd, "ERROR Failed to retrieve chunk " + chunk.chunk_index);
+        }
     }
-
-    if (node_response.substr(0, 4) != "FILE") {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR " + node_response);
-        return;
-    }
-
-    // Parse "FILE <filename> <filesize>"
-    std::istringstream response_stream(node_response);
-    std::string tag, received_filename;
-    size_t received_filesize;
-    response_stream >> tag >> received_filename >> received_filesize;
-
-    std::vector<char> file_buffer(received_filesize);
-    if (recv_file_data(node_connection_fd, received_filesize, file_buffer.data()) != 0) {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR Failed to read file from node");
-        return;
-    }
-    close(node_connection_fd);
-
-    // Send OK with filesize so client knows how many bytes to read
-    send_response(client_fd, "OK " + std::to_string(received_filesize));
-    send(client_fd, file_buffer.data(), received_filesize, 0);
 
     std::cout << "[Client " << client_id << "] Download complete: " << filename << "\n";
 }
@@ -416,7 +549,7 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
 void handle_delete(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DELETE " << filename << "\n";
 
-    int target_node_id;
+    FileMetadata file_metadata;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         auto entry = file_metadata_map.find(filename);
@@ -424,29 +557,48 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
             send_response(client_fd, "ERROR File not found");
             return;
         }
-        target_node_id = entry->second.node_id;
+        file_metadata = entry->second;
     }
 
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
-        send_response(client_fd, "ERROR Could not reach storage node");
-        return;
+    // track if everything has been deleted
+    bool all_deleted = true;
+    for (const auto& chunk : file_metadata.chunks) {
+        std::string chunk_filename = filename + "_chunk" + std::to_string(chunk.chunk_index);
+
+        for (int target_node_id : chunk.redundancy_ids) {
+            int node_connection_fd = connect_to_node(target_node_id);
+
+            if (node_connection_fd < 0) {
+                all_deleted = false;
+                // send_response(client_fd, "ERROR Could not reach storage node");
+                continue;
+            }
+
+            std::string delete_command = "NODE_DELETE " + chunk_filename + "\n";
+            send_all(node_connection_fd, delete_command.c_str(), delete_command.size());
+
+            std::string node_response;
+            recv_line(node_connection_fd, node_response);
+            close(node_connection_fd);
+
+            if (node_response.substr(0, 2) == "OK") {
+                std::lock_guard<std::mutex> lock(metadata_mutex);
+                update_node_size(target_node_id, -(off_t)chunk.size);
+            } else {
+                all_deleted = false;
+            }
+        }
     }
 
-    std::string delete_command = "NODE_DELETE " + filename + "\n";
-    send_all(node_connection_fd, delete_command.c_str(), delete_command.size());
-
-    std::string node_response;
-    recv_line(node_connection_fd, node_response);
-    close(node_connection_fd);
-
-    if (node_response.substr(0, 2) == "OK") {
+    { 
         std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)file_metadata_map[filename].filesize);
         file_metadata_map.erase(filename);
+    }
+
+    if (all_deleted) {
         send_response(client_fd, "OK File deleted");
     } else {
-        send_response(client_fd, "ERROR Failed to delete file");
+        send_response(client_fd, "ERROR Failed to completely delete file. Some fragments may still remain");
     }
 }
 
