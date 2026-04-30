@@ -9,6 +9,9 @@ static const int NODE_BASE_PORT = 9001;
 // Number of storage nodes (can be any # just chose 3 to start)
 static const int NUM_NODES = 3;
 
+// How many nodes each file is stored on (1 = no redundancy, 2 = survive 1 node failure)
+static const int REPLICATION_FACTOR = 2;
+
 // Read/write buffer size for TCP transfers
 static const int BUFFER_SIZE = 4096;
 

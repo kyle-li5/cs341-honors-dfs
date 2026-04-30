@@ -60,10 +60,11 @@ std::atomic<int> client_count(0);
 // Shared mutex so concurrent threads don't interleave their console output
 std::mutex print_mutex;
 
-// Tracks which node a file lives on and how large it is.
-// The server uses this to route DOWNLOAD and DELETE to the right node.
+// Tracks which node(s) a file lives on and how large it is.
+// node_id is the primary; replica_node_id is -1 if no replica exists (degraded).
 struct FileMetadata {
     int    node_id;
+    int    replica_node_id;
     size_t filesize;
 };
 
@@ -102,11 +103,21 @@ static void handle_shutdown_signal(int signal_number) {
 
 // Opens a TCP connection to a node running on localhost at NODE_BASE_PORT + node_id.
 // Returns the connection fd, or -1 if the connection failed.
+// 5-second recv/send timeouts are set so a dead node's stalled socket doesn't
+// block the coordinator forever (Hayden's RANDOM_FAILURES pthread_exit leaves
+// the listen socket open but stops accepting, causing connects to succeed but
+// responses to never arrive).
 static int connect_to_node(int node_id) {
     int connection_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (connection_fd < 0) {
         return -1;
     }
+
+    struct timeval timeout;
+    timeout.tv_sec  = 5;
+    timeout.tv_usec = 0;
+    setsockopt(connection_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(connection_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     struct sockaddr_in node_address;
     memset(&node_address, 0, sizeof(node_address));
@@ -199,7 +210,12 @@ static void rebuild_metadata_from_nodes() {
             line_stream >> filename >> filesize;
 
             if (!filename.empty()) {
-                file_metadata_map[filename] = {node_id, filesize};
+                auto existing = file_metadata_map.find(filename);
+                if (existing == file_metadata_map.end()) {
+                    file_metadata_map[filename] = {node_id, -1, filesize};
+                } else {
+                    existing->second.replica_node_id = node_id;
+                }
                 node_bytes[node_id] += (off_t)filesize;
                 std::cout << "[startup] recovered " << filename
                           << " on node " << node_id << "\n";
@@ -235,129 +251,199 @@ void handle_list(int client_fd, int client_id) {
     }
 }
 
-// Receives the file from the client then forwards it to a storage node.
-// Always picks the least-loaded node from the min-heap, even on overwrite,
-// so a file that grows substantially can migrate off an over-loaded node.
+// Sends the file to one node via NODE_STORE and returns whether it succeeded.
+static bool store_on_node(int node_id, const std::string& filename,
+                          const std::vector<char>& data) {
+    int node_fd = connect_to_node(node_id);
+    if (node_fd < 0) {
+        return false;
+    }
+    std::string cmd = "NODE_STORE " + filename + " "
+                      + std::to_string(data.size()) + "\n";
+    send_all(node_fd, cmd.c_str(), cmd.size());
+    send_all(node_fd, data.data(), data.size());
+    std::string resp;
+    bool ok = (recv_line(node_fd, resp) == 0 && resp.substr(0, 2) == "OK");
+    close(node_fd);
+    return ok;
+}
+
+// Sends NODE_DELETE to a node. Best-effort: logs on failure but does not abort.
+static void delete_from_node(int node_id, const std::string& filename) {
+    int node_fd = connect_to_node(node_id);
+    if (node_fd < 0) {
+        std::cerr << "[warn] could not reach node " << node_id
+                  << " to delete orphan " << filename << "\n";
+        return;
+    }
+    std::string cmd = "NODE_DELETE " + filename + "\n";
+    send_all(node_fd, cmd.c_str(), cmd.size());
+    std::string resp;
+    if (recv_line(node_fd, resp) != 0 || resp.substr(0, 2) != "OK") {
+        std::cerr << "[warn] node " << node_id << " failed to delete " << filename << "\n";
+    }
+    close(node_fd);
+}
+
+// Receives a file from the client, writes it to REPLICATION_FACTOR nodes chosen
+// from the min-heap (primary + replica), and updates metadata.
+// If the replica upload fails the file is still stored on the primary (degraded mode).
+// Overwrites always pick fresh nodes from the heap — a file that grew substantially
+// can migrate off an over-loaded node; displaced old copies are cleaned up after commit.
 void handle_upload(int client_fd, int client_id, const std::string& filename, size_t filesize) {
     std::cout << "[Client " << client_id << "] UPLOAD " << filename
               << " (" << filesize << " bytes)\n";
 
-    // Validate filename to prevent directory traversal attacks
     if (filename.find("..") != std::string::npos || filename.find("/") != std::string::npos) {
         send_response(client_fd, "ERROR Invalid filename");
         return;
     }
 
-    // Receive file bytes from the client into a buffer
     std::vector<char> file_buffer(filesize);
     if (!read_exact(client_fd, file_buffer.data(), filesize)) {
         send_response(client_fd, "ERROR Connection lost during upload");
         return;
     }
 
-    // Pick the target node and *reserve* its bytes immediately so concurrent
-    // uploads see the updated load and don't all stampede onto the same node.
-    // Also block concurrent uploads of the same filename to prevent orphaned
-    // node copies.
-    int    target_node_id;
-    bool   is_overwrite = false;
-    int    old_node_id  = -1;
-    size_t old_size     = 0;
+    // Select nodes and reserve bytes under the lock so concurrent uploads
+    // see updated load and route to different nodes.
+    int    primary_node_id = -1;
+    int    replica_node_id = -1;
+    bool   is_overwrite    = false;
+    int    old_primary     = -1;
+    int    old_replica     = -1;
+    size_t old_size        = 0;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         if (pending_uploads.count(filename)) {
             send_response(client_fd, "ERROR Upload already in progress for this file");
             return;
         }
-        auto existing_entry = file_metadata_map.find(filename);
-        if (existing_entry != file_metadata_map.end()) {
+        auto existing = file_metadata_map.find(filename);
+        if (existing != file_metadata_map.end()) {
             is_overwrite = true;
-            old_node_id  = existing_entry->second.node_id;
-            old_size     = existing_entry->second.filesize;
+            old_primary  = existing->second.node_id;
+            old_replica  = existing->second.replica_node_id;
+            old_size     = existing->second.filesize;
         }
-        target_node_id = node_min_heap.begin()->second;          // O(1)
-        update_node_size(target_node_id, (off_t)filesize);       // reserve
+
+        // Pick the REPLICATION_FACTOR least-loaded nodes from the heap.
+        // NOTE: update_node_size erases and reinserts, invalidating iterators,
+        // so we must re-iterate after each update rather than advancing the
+        // original iterator.
+        primary_node_id = node_min_heap.begin()->second;
+        update_node_size(primary_node_id, (off_t)filesize);
+
+        if (REPLICATION_FACTOR >= 2) {
+            for (const auto& entry : node_min_heap) {
+                if (entry.second != primary_node_id) {
+                    replica_node_id = entry.second;
+                    update_node_size(replica_node_id, (off_t)filesize);
+                    break;
+                }
+            }
+        }
         pending_uploads.insert(filename);
     }
 
-    // Forward the file to the target node
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
+    // Upload to primary — if this fails nothing was committed, undo and bail.
+    if (!store_on_node(primary_node_id, filename, file_buffer)) {
         std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
-        pending_uploads.erase(filename);
-        send_response(client_fd, "ERROR Could not reach storage node");
-        return;
-    }
-
-    std::string store_command = "NODE_STORE " + filename + " "
-                               + std::to_string(filesize) + "\n";
-    send_all(node_connection_fd, store_command.c_str(), store_command.size());
-    send_all(node_connection_fd, file_buffer.data(), filesize);
-
-    std::string node_response;
-    if (recv_line(node_connection_fd, node_response) != 0
-            || node_response.substr(0, 2) != "OK") {
-        close(node_connection_fd);
-        std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)filesize);      // undo reservation
+        update_node_size(primary_node_id, -(off_t)filesize);
+        if (replica_node_id >= 0) {
+            update_node_size(replica_node_id, -(off_t)filesize);
+        }
         pending_uploads.erase(filename);
         send_response(client_fd, "ERROR Storage node failed to store file");
         return;
     }
-    close(node_connection_fd);
 
-    // If this was an overwrite that landed on a different node, the old copy
-    // is now orphaned — tell the old node to delete it. If the old node is
-    // unreachable or refuses, we log it but still commit the new metadata
-    // (the new copy is the source of truth). The orphan would need manual
-    // cleanup; startup recovery does not currently detect cross-node duplicates.
-    if (is_overwrite && old_node_id != target_node_id) {
-        bool orphan_cleaned = false;
-        int  old_node_fd    = connect_to_node(old_node_id);
-        if (old_node_fd >= 0) {
-            std::string delete_cmd = "NODE_DELETE " + filename + "\n";
-            send_all(old_node_fd, delete_cmd.c_str(), delete_cmd.size());
-            std::string old_response;
-            if (recv_line(old_node_fd, old_response) == 0
-                    && old_response.substr(0, 2) == "OK") {
-                orphan_cleaned = true;
-            }
-            close(old_node_fd);
-        }
-        if (!orphan_cleaned) {
-            std::cerr << "[warn] orphan copy of " << filename
-                      << " left on node " << old_node_id
-                      << " after migration to node " << target_node_id << "\n";
-        }
+    // Upload to replica (best-effort) — failure means degraded mode, not abort.
+    if (replica_node_id >= 0 && !store_on_node(replica_node_id, filename, file_buffer)) {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        update_node_size(replica_node_id, -(off_t)filesize);
+        replica_node_id = -1;
+        std::cerr << "[warn] replica upload failed for " << filename
+                  << " — storing primary only (degraded)\n";
     }
 
+    // Commit: debit old nodes' sizes, update metadata, collect displaced old
+    // nodes that need their copy deleted (those not reused in the new placement).
+    std::vector<int> orphaned_nodes;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         if (is_overwrite) {
-            // Release the old file's bytes from whichever node held it.
-            // If old_node == target, this nets against part of our reservation.
-            update_node_size(old_node_id, -(off_t)old_size);
+            for (int old_node : {old_primary, old_replica}) {
+                if (old_node < 0) { continue; }
+                update_node_size(old_node, -(off_t)old_size);
+                if (old_node != primary_node_id && old_node != replica_node_id) {
+                    orphaned_nodes.push_back(old_node);
+                }
+            }
         }
-        file_metadata_map[filename] = {target_node_id, filesize};
+        file_metadata_map[filename] = {primary_node_id, replica_node_id, filesize};
         pending_uploads.erase(filename);
     }
 
-    if (is_overwrite) {
-        send_response(client_fd, "OK File updated successfully");
-    } else {
-        send_response(client_fd, "OK File uploaded successfully");
+    // Best-effort cleanup of displaced copies from old nodes.
+    for (int orphan : orphaned_nodes) {
+        delete_from_node(orphan, filename);
     }
 
+    send_response(client_fd, is_overwrite ? "OK File updated successfully"
+                                          : "OK File uploaded successfully");
+
     std::cout << "[Client " << client_id << "] Upload complete: " << filename
-              << " -> node " << target_node_id << "\n";
+              << " -> node " << primary_node_id;
+    if (replica_node_id >= 0) {
+        std::cout << " + replica on node " << replica_node_id;
+    } else {
+        std::cout << " (degraded — no replica)";
+    }
+    std::cout << "\n";
 }
 
-// Looks up which node has the file, retrieves it, and streams it to the client.
+// Tries to retrieve a file from one node and stream it to the client.
+// Returns true on success. On failure the connection is closed and nothing
+// has been sent to client_fd yet.
+static bool retrieve_from_node(int client_fd, int node_id, const std::string& filename) {
+    int node_fd = connect_to_node(node_id);
+    if (node_fd < 0) {
+        return false;
+    }
+
+    std::string cmd = "NODE_RETRIEVE " + filename + "\n";
+    send_all(node_fd, cmd.c_str(), cmd.size());
+
+    std::string node_response;
+    if (recv_line(node_fd, node_response) != 0 || node_response.substr(0, 4) != "FILE") {
+        close(node_fd);
+        return false;
+    }
+
+    std::istringstream ss(node_response);
+    std::string tag, recv_filename;
+    size_t recv_filesize = 0;
+    ss >> tag >> recv_filename >> recv_filesize;
+
+    std::vector<char> file_buffer(recv_filesize);
+    if (recv_file_data(node_fd, recv_filesize, file_buffer.data()) != 0) {
+        close(node_fd);
+        return false;
+    }
+    close(node_fd);
+
+    send_response(client_fd, "OK " + std::to_string(recv_filesize));
+    send(client_fd, file_buffer.data(), recv_filesize, 0);
+    return true;
+}
+
+// Looks up the file, tries the primary node, and falls back to the replica
+// if the primary is unreachable or returns an error (node may have crashed).
 void handle_download(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DOWNLOAD " << filename << "\n";
 
-    int target_node_id;
+    int primary_node_id, replica_node_id;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         auto entry = file_metadata_map.find(filename);
@@ -365,58 +451,37 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
             send_response(client_fd, "ERROR File not found");
             return;
         }
-        target_node_id = entry->second.node_id;
+        primary_node_id = entry->second.node_id;
+        replica_node_id = entry->second.replica_node_id;
     }
 
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
-        send_response(client_fd, "ERROR Could not reach storage node");
+    if (retrieve_from_node(client_fd, primary_node_id, filename)) {
+        std::cout << "[Client " << client_id << "] Download complete: " << filename
+                  << " from node " << primary_node_id << "\n";
         return;
     }
 
-    std::string retrieve_command = "NODE_RETRIEVE " + filename + "\n";
-    send_all(node_connection_fd, retrieve_command.c_str(), retrieve_command.size());
-
-    // Node responds with "FILE <filename> <filesize>\n<bytes>"
-    std::string node_response;
-    if (recv_line(node_connection_fd, node_response) != 0) {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR Node disconnected");
-        return;
+    if (replica_node_id >= 0) {
+        std::cout << "[Client " << client_id << "] Primary node " << primary_node_id
+                  << " unreachable, trying replica node " << replica_node_id << "\n";
+        if (retrieve_from_node(client_fd, replica_node_id, filename)) {
+            std::cout << "[Client " << client_id << "] Download complete: " << filename
+                      << " from replica node " << replica_node_id << "\n";
+            return;
+        }
     }
 
-    if (node_response.substr(0, 4) != "FILE") {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR " + node_response);
-        return;
-    }
-
-    // Parse "FILE <filename> <filesize>"
-    std::istringstream response_stream(node_response);
-    std::string tag, received_filename;
-    size_t received_filesize;
-    response_stream >> tag >> received_filename >> received_filesize;
-
-    std::vector<char> file_buffer(received_filesize);
-    if (recv_file_data(node_connection_fd, received_filesize, file_buffer.data()) != 0) {
-        close(node_connection_fd);
-        send_response(client_fd, "ERROR Failed to read file from node");
-        return;
-    }
-    close(node_connection_fd);
-
-    // Send OK with filesize so client knows how many bytes to read
-    send_response(client_fd, "OK " + std::to_string(received_filesize));
-    send(client_fd, file_buffer.data(), received_filesize, 0);
-
-    std::cout << "[Client " << client_id << "] Download complete: " << filename << "\n";
+    send_response(client_fd, "ERROR File unavailable — all replicas unreachable");
 }
 
-// Tells the node holding the file to delete it, then removes it from the metadata map.
+// Deletes from all nodes holding the file (primary + replica).
+// Succeeds if at least one node confirms deletion — if a node is down,
+// its stale copy becomes unreachable via the coordinator anyway.
 void handle_delete(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DELETE " << filename << "\n";
 
-    int target_node_id;
+    int    primary_node_id, replica_node_id;
+    size_t filesize;
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
         auto entry = file_metadata_map.find(filename);
@@ -424,30 +489,38 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
             send_response(client_fd, "ERROR File not found");
             return;
         }
-        target_node_id = entry->second.node_id;
+        primary_node_id = entry->second.node_id;
+        replica_node_id = entry->second.replica_node_id;
+        filesize        = entry->second.filesize;
     }
 
-    int node_connection_fd = connect_to_node(target_node_id);
-    if (node_connection_fd < 0) {
-        send_response(client_fd, "ERROR Could not reach storage node");
+    auto try_delete = [&](int node_id) -> bool {
+        int node_fd = connect_to_node(node_id);
+        if (node_fd < 0) { return false; }
+        std::string cmd = "NODE_DELETE " + filename + "\n";
+        send_all(node_fd, cmd.c_str(), cmd.size());
+        std::string resp;
+        recv_line(node_fd, resp);
+        close(node_fd);
+        return resp.substr(0, 2) == "OK";
+    };
+
+    bool primary_deleted = try_delete(primary_node_id);
+    bool replica_deleted = (replica_node_id >= 0) && try_delete(replica_node_id);
+
+    if (!primary_deleted && !replica_deleted) {
+        send_response(client_fd, "ERROR Failed to delete file from any node");
         return;
     }
 
-    std::string delete_command = "NODE_DELETE " + filename + "\n";
-    send_all(node_connection_fd, delete_command.c_str(), delete_command.size());
-
-    std::string node_response;
-    recv_line(node_connection_fd, node_response);
-    close(node_connection_fd);
-
-    if (node_response.substr(0, 2) == "OK") {
+    {
         std::lock_guard<std::mutex> lock(metadata_mutex);
-        update_node_size(target_node_id, -(off_t)file_metadata_map[filename].filesize);
+        if (primary_deleted) { update_node_size(primary_node_id, -(off_t)filesize); }
+        if (replica_deleted)  { update_node_size(replica_node_id, -(off_t)filesize); }
         file_metadata_map.erase(filename);
-        send_response(client_fd, "OK File deleted");
-    } else {
-        send_response(client_fd, "ERROR Failed to delete file");
     }
+
+    send_response(client_fd, "OK File deleted");
 }
 
 // Queries each node for its file count and total storage used, then sends a summary.
