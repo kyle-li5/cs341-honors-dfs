@@ -5,10 +5,9 @@ dfs_tui.py — Textual TUI for the Distributed File System.
 Three live panels that auto-refresh every 3 s:
   • Storage Nodes  — health, file count, bytes, and load bar per node.
                      Queried *directly* from node ports 9001-9003 via
-                     NODE_STATUS / NODE_LIST so you see the actual node
-                     internals, not just what the coordinator cached.
-  • Files          — full listing attributed to each storage node,
-                     aggregated from all three NODE_LIST responses.
+                     NODE_STATUS so you see the actual node internals.
+  • Files          — one row per logical file showing total size, chunk
+                     count, and which nodes hold each chunk.
   • Activity Log   — scrolling record of every command and its result.
 
 Command bar (same commands as client.cpp):
@@ -91,36 +90,6 @@ async def fetch_node_status(node_id: int) -> dict:
     return {"id": node_id, "files": 0, "bytes": 0, "reachable": False}
 
 
-async def fetch_node_files(node_id: int) -> list[tuple[str, int]]:
-    """
-    Open a one-shot connection to node NODE_BASE_PORT+node_id and send
-    NODE_LIST.  Response: "LIST <count>" then "<filename> <size>" per file.
-    """
-    try:
-        r, w = await asyncio.wait_for(
-            asyncio.open_connection(HOST, NODE_BASE_PORT + node_id),
-            timeout=CONNECT_TIMEOUT,
-        )
-        w.write(b"NODE_LIST\n")
-        await w.drain()
-        hdr = (await asyncio.wait_for(r.readline(), timeout=CONNECT_TIMEOUT)).decode().strip()
-        p = hdr.split()
-        if len(p) < 2 or p[0] != "LIST":
-            w.close()
-            return []
-        count = int(p[1])
-        files: list[tuple[str, int]] = []
-        for _ in range(count):
-            line = (await asyncio.wait_for(r.readline(), timeout=CONNECT_TIMEOUT)).decode().strip()
-            lp = line.split()
-            if len(lp) >= 2:
-                files.append((lp[0], int(lp[1])))
-        w.close()
-        return files
-    except Exception:
-        return []
-
-
 # ── coordinator connection ─────────────────────────────────────────────────
 
 class Coordinator:
@@ -178,6 +147,52 @@ class Coordinator:
         return bytes(buf)
 
     # ── public commands ────────────────────────────────────────────────────
+
+    async def list_files(self) -> list[tuple[str, int]]:
+        """
+        LIST\n → "OK <count>\n" then "<filename> <size>\n" per logical file.
+        """
+        if err := self._guard():
+            return []
+        async with self._lock:
+            await self._send(b"LIST\n")
+            hdr = await self._readline()
+            p = hdr.split()
+            if len(p) < 2 or p[0] != "OK":
+                return []
+            count = int(p[1])
+            files: list[tuple[str, int]] = []
+            for _ in range(count):
+                line = await self._readline()
+                lp = line.split()
+                if len(lp) >= 2:
+                    files.append((lp[0], int(lp[1])))
+            return files
+
+    async def status_file(self, filename: str) -> list[dict]:
+        """
+        STATUS <filename>\n → "OK <chunk_count> <total_size>\n"
+        then "CHUNK <idx> <size> <node_count> <node0> …\n" per chunk.
+        Returns a list of dicts: {index, size, nodes}.
+        """
+        if err := self._guard():
+            return []
+        async with self._lock:
+            await self._send(f"STATUS {filename}\n".encode())
+            hdr = await self._readline()
+            p = hdr.split()
+            if len(p) < 3 or p[0] != "OK":
+                return []
+            chunk_count = int(p[1])
+            chunks: list[dict] = []
+            for _ in range(chunk_count):
+                line = await self._readline()
+                lp = line.split()
+                if len(lp) >= 4 and lp[0] == "CHUNK":
+                    n_nodes = int(lp[3])
+                    nodes = [int(lp[4 + i]) for i in range(n_nodes) if 4 + i < len(lp)]
+                    chunks.append({"index": int(lp[1]), "size": int(lp[2]), "nodes": nodes})
+            return chunks
 
     async def upload(self, filepath: str) -> str:
         """
@@ -296,7 +311,7 @@ class DFSApp(App):
             with Vertical(id="files-panel"):
                 yield Label("Files", id="files-title", classes="panel-title")
                 tbl = DataTable(id="files-table", zebra_stripes=True, cursor_type="row")
-                tbl.add_columns("Filename", "Size", "Node", "Port")
+                tbl.add_columns("Filename", "Size", "Chunks", "Distribution")
                 yield tbl
         yield Input(
             placeholder="list  upload <path>  download <name>  delete <name>  help  quit",
@@ -322,14 +337,25 @@ class DFSApp(App):
 
     # ── data refresh (queries node ports directly) ──────────────────────────
 
+    async def _fetch_file_data(self) -> list[tuple[tuple[str, int], list[dict]]]:
+        """Ask the coordinator for the logical file list then chunk details per file."""
+        if not self._coord.connected:
+            return []
+        files = await self._coord.list_files()
+        result: list[tuple[tuple[str, int], list[dict]]] = []
+        for fname, size in files:
+            chunks = await self._coord.status_file(fname)
+            result.append(((fname, size), chunks))
+        return result
+
     async def _refresh(self):
-        """Fetch node status and node file lists concurrently then re-render."""
-        node_stats, node_files = await asyncio.gather(
+        """Fetch node status (direct) and file metadata (via coordinator) concurrently."""
+        node_stats, file_data = await asyncio.gather(
             asyncio.gather(*[fetch_node_status(i) for i in range(NUM_NODES)]),
-            asyncio.gather(*[fetch_node_files(i) for i in range(NUM_NODES)]),
+            self._fetch_file_data(),
         )
         self._render_nodes(list(node_stats))
-        self._render_files(list(node_files))
+        self._render_files(file_data)
 
     def _render_nodes(self, stats: list[dict]):
         total_bytes = sum(s["bytes"] for s in stats if s["reachable"])
@@ -352,15 +378,23 @@ class DFSApp(App):
                     f"  [yellow]{bar}[/]  {pct:.0f}%\n"
                 )
 
-    def _render_files(self, files_per_node: list[list[tuple[str, int]]]):
+    def _render_files(self, file_data: list[tuple[tuple[str, int], list[dict]]]):
         tbl = self.query_one("#files-table", DataTable)
         tbl.clear()
-        total = 0
-        for node_id, files in enumerate(files_per_node):
-            port = NODE_BASE_PORT + node_id
-            for filename, size in files:
-                tbl.add_row(filename, fmt_bytes(size), f"node-{node_id}", str(port))
-                total += 1
+        for (filename, size), chunks in file_data:
+            if not chunks:
+                dist = "—"
+            elif len(chunks) == 1:
+                nodes = chunks[0]["nodes"]
+                dist = "  ".join(f"N{n}" for n in nodes)
+            else:
+                parts = []
+                for c in chunks:
+                    node_str = ",".join(str(n) for n in c["nodes"])
+                    parts.append(f"c{c['index']}:[{node_str}]")
+                dist = "  ".join(parts)
+            tbl.add_row(filename, fmt_bytes(size), str(len(chunks)), dist)
+        total = len(file_data)
         self.query_one("#files-title", Label).update(f"Files  ({total} total)")
 
     async def action_refresh(self):
