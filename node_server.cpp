@@ -12,6 +12,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 
 NodeServer::NodeServer(int node_id)
     : node_id(node_id), listen_fd(-1), local_storage(node_id) {}
@@ -105,12 +106,23 @@ void NodeServer::handle_connection(int connection_fd) {
     if (command == "NODE_STORE") {
         std::string filename;
         size_t filesize;
+        int num_redundancies = 0;
+        std::vector<int> redundant_nodes;
+
         if (!(command_stream >> filename >> filesize)) {
             std::string error_response = "ERROR invalid NODE_STORE syntax\n";
             send_all(connection_fd, error_response.c_str(), error_response.size());
             return;
         }
-        handle_store(connection_fd, filename, filesize);
+        if (command_stream >> num_redundancies) {
+            for (int i = 0; i < num_redundancies; ++i) {
+                int next_node_id;
+                if (command_stream >> next_node_id) {
+                    redundant_nodes.push_back(next_node_id);
+                }
+            }
+        }
+        handle_store(connection_fd, filename, filesize, redundant_nodes);
 
     } else if (command == "NODE_RETRIEVE") {
         std::string filename;
@@ -147,7 +159,7 @@ void NodeServer::handle_connection(int connection_fd) {
 // the file. A pipe is needed because NodeInternal expects a file descriptor,
 // not a buffer. We use a thread to write into the pipe while NodeInternal
 // reads from it simultaneously to avoid a deadlock.
-void NodeServer::handle_store(int connection_fd, const std::string &filename, size_t filesize) {
+void NodeServer::handle_store(int connection_fd, const std::string &filename, size_t filesize, std::vector<int>& redundant_nodes) {
     int pipe_fds[2];
     if (pipe(pipe_fds) != 0) {
         perror("node_server pipe");
@@ -156,9 +168,54 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         return;
     }
 
+    // setup pipeline for server to send redundant chunks efficiently
+    int node_fd = -1;
+    if (!redundant_nodes.empty()) {
+        int next_node = redundant_nodes[0];
+
+        node_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+        // Match the coordinator's 5s recv/send timeouts so a downstream node
+        // dying mid-pipeline doesn't hang this node forever on the ack.
+        struct timeval timeout;
+        timeout.tv_sec  = 5;
+        timeout.tv_usec = 0;
+        setsockopt(node_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(node_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        struct sockaddr_in sockaddr;
+        memset(&sockaddr, 0, sizeof(sockaddr));
+        sockaddr.sin_family = AF_INET;
+        sockaddr.sin_port = htons(NODE_BASE_PORT + next_node);
+        inet_pton(AF_INET, "127.0.0.1", &sockaddr.sin_addr);
+
+        if (connect(node_fd, (struct sockaddr*)& sockaddr, sizeof(sockaddr)) == 0) {
+            std::string forward_command = "NODE_STORE " + filename + " " + std::to_string(filesize);
+            int remaining_nodes = redundant_nodes.size() - 1;
+
+            if (remaining_nodes > 0) {
+                forward_command += " " + std::to_string(remaining_nodes);
+                for (size_t i = 1; i < redundant_nodes.size(); ++i) {
+                    forward_command += " " + std::to_string(redundant_nodes[i]);
+                }
+            }
+            forward_command += "\n";
+            send_all(node_fd, forward_command.c_str(), forward_command.size());
+        } else {
+            std::cerr << "[node " << node_id << "] warning: failed to connect to node " << next_node << "\n";
+            close(node_fd);
+            node_fd = -1;
+        }
+    }
+
     // Spawn a thread to stream bytes from the connection into the write end
     // of the pipe while NodeInternal reads from the read end simultaneously.
-    std::thread pipe_writer([connection_fd, filesize, write_end_fd = pipe_fds[1]]() {
+    // The thread is joined (not detached) before we ACK the upstream caller —
+    // its tail does recv_line(node_fd, ack), so joining ensures the downstream
+    // chain has finished writing before we tell our caller "OK". Without this
+    // a STATUS query right after upload could see the tail node missing the
+    // last chunk because the head ACKed before the chain caught up.
+    std::thread pipe_writer([connection_fd, filesize, node_fd, write_end_fd = pipe_fds[1]]() {
         char chunk[BUFFER_SIZE];
         size_t bytes_remaining = filesize;
 
@@ -184,12 +241,23 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
                 }
                 bytes_written += (size_t)result;
             }
+
+            // send chunk to node
+            if (node_fd >= 0) {
+                send_all(node_fd, chunk, bytes_received);
+            }
             bytes_remaining -= (size_t)bytes_received;
         }
         done:
         close(write_end_fd);
+
+        // wait for node to finish writing before closing
+        if (node_fd >= 0) {
+            std::string ack;
+            recv_line(node_fd, ack);
+            close(node_fd);
+        }
     });
-    pipe_writer.detach();
 
     int store_result;
     {
@@ -206,6 +274,10 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         }
     }
     close(pipe_fds[0]);
+
+    // Wait for the pipe_writer (which is also waiting on the downstream ACK)
+    // before responding, so our OK happens-after the entire chain's writes.
+    pipe_writer.join();
 
     if (store_result != 0) {
         std::string error_response = "ERROR failed to store file\n";

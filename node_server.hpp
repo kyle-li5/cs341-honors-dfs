@@ -2,6 +2,7 @@
 
 #include <thread>
 #include <mutex>
+#include <vector>
 #include "node/nodeinternal.hpp"
 
 // Shared mutex for serializing console output across threads
@@ -29,7 +30,7 @@ private:
     void handle_connection(int connection_fd);
 
     // Receives file bytes from the connection and stores them via NodeInternal.
-    void handle_store(int connection_fd, const std::string &filename, size_t filesize);
+    void handle_store(int connection_fd, const std::string &filename, size_t filesize, std::vector<int>& redundant_nodes);
 
     // Reads a stored file via NodeInternal and sends its bytes back over the connection.
     void handle_retrieve(int connection_fd, const std::string &filename);
