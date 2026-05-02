@@ -56,8 +56,12 @@ int send_file_data(int connection_fd, const char *filename, off_t filesize, int 
         return -1;
     }
 
-    // Stream file contents in 4096-byte chunks
-    char chunk[4096];
+    // Stream file contents in 64 KB blocks. Smaller buffers (e.g. 4 KB)
+    // turn each NODE_RETRIEVE response into hundreds of small TCP sends,
+    // which interact poorly with macOS receiver-side delayed-ACK and slow
+    // downloads to ~5 MB/s. 64 KB lets us push at line rate without
+    // bloating per-call memory.
+    char chunk[64 * 1024];
     off_t bytes_remaining = filesize;
 
     while (bytes_remaining > 0) {
