@@ -415,7 +415,7 @@ int main(int argc, char* argv[]) {
             }
         } else {
             std::cerr << "Unknown command: " << command << "\n";
-            std::cerr << "Commands: list, upload, download, delete, status, status <filename> quit\n";
+            std::cerr << "Commands: list, upload, download, delete, status, status <filename>, quit\n";
         }
     }
 
