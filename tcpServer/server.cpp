@@ -794,6 +794,41 @@ void handle_status(int client_fd, int client_id) {
     }
 }
 
+
+// checks metadata map and outputs chunk and node info for each file
+// Response format: "OK <chunk_count> <total_size>\n" 
+// followed by one "CHUNK <index> <size> <node_count> <node1> <node2> ...\n" per chunk.
+void handle_status_file(int client_fd, int client_id, const std::string& filename) {
+    std::cout << "[Client " << client_id << "] STATUS " << filename << "\n";
+
+    FileMetadata file_metadata;
+
+    {
+        std::lock_guard<std::mutex> lock(metadata_mutex);
+        auto file = file_metadata_map.find(filename);
+        if (file == file_metadata_map.end()) {
+            send_response(client_fd, "ERROR File not found");
+            return;
+        }
+        file_metadata = file->second;
+    }
+
+    std::string header = "OK " + std::to_string(file_metadata.chunks.size()) + " " +
+        std::to_string(file_metadata.total_size) + "\n";
+    send_all(client_fd, header.c_str(), header.size());
+
+    for (const auto& chunk : file_metadata.chunks) {
+        std::string chunk_str = "CHUNK " + std::to_string(chunk.chunk_index) + " "
+            +  std::to_string(chunk.size) + " " + std::to_string(chunk.redundancy_ids.size());
+
+        for (int node_id : chunk.redundancy_ids) {
+            chunk_str += " " + std::to_string(node_id);
+        }
+        chunk_str += "\n";
+        send_all(client_fd, chunk_str.c_str(), chunk_str.size());
+    }
+}
+
 // Background thread: every 10 seconds ping each dead node via NODE_STATUS.
 // If a node responds, revive it: remove from dead_nodes and sync its byte
 // count back into the heap so future uploads can route to it again.
@@ -894,7 +929,14 @@ void handle_client(int client_fd, int client_id) {
                 handle_delete(client_fd, client_id, filename);
             }
         } else if (cmd == "STATUS") {
-            handle_status(client_fd, client_id);
+            std::string filename;
+            iss >> filename;
+
+            if (filename.empty()) {
+                handle_status(client_fd, client_id);
+            } else {
+                handle_status_file(client_fd, client_id, filename);
+            }
         } else {
             send_response(client_fd, "ERROR Unknown command. Available: LIST, UPLOAD, DOWNLOAD, DELETE, STATUS, QUIT");
         }

@@ -255,6 +255,49 @@ static void cmd_status(int coordinator_fd) {
     }
 }
 
+// parse status for specific file
+static void cmd_status_file(int coordinator_fd, const std::string& filename) {
+    std::string request = "STATUS " + filename + "\n";
+    send_all(coordinator_fd, request.c_str(), request.size());
+
+    std::string response = read_coordinator_line(coordinator_fd);
+    if (response.substr(0, 2) != "OK") {
+        std::cerr << "Error: " << response << "\n";
+        return;
+    }
+
+    std::istringstream response_stream(response);
+    std::string tag;
+    int chunk_count = 0;
+    long long total_size = 0;
+    response_stream >> tag >> chunk_count >> total_size;
+
+    std::cout << "File status: " << filename << "\n";
+    std::cout << "Total size: " << total_size << " bytes\n";
+    std::cout << "Total chunks: " << chunk_count << "\n";
+
+    for (int i = 0; i < chunk_count; i++) {
+        std::string node_line = read_coordinator_line(coordinator_fd);
+
+        // Each line is "CHUNK <index> <size> <node_count> <node1> <node2> ..." 
+        std::istringstream line_stream(node_line);
+        std::string chunk_tag;
+        int chunk_index;
+        long long chunk_size = 0;
+        int node_count = 0;
+        line_stream >> chunk_tag >> chunk_index >> chunk_size >> node_count;
+
+        std::cout << "\tChunk " << chunk_index << " (" << chunk_size << " bytes) -> Nodes: ";
+
+        for (int j = 0; j < node_count; ++j) {
+            int node_id;
+            line_stream >> node_id;
+            std::cout << "[" << node_id << "] ";
+        }
+        std::cout << "\n";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main -- interactive dfs> prompt
 // ---------------------------------------------------------------------------
@@ -363,10 +406,16 @@ int main(int argc, char* argv[]) {
                 cmd_delete(coordinator_fd, filename);
             }
         } else if (command == "status") {
-            cmd_status(coordinator_fd);
+            std::string filename;
+            std::getline(input_stream >> std::ws, filename);
+            if (filename.empty()) {
+                cmd_status(coordinator_fd);
+            } else {
+                cmd_status_file(coordinator_fd, filename);
+            }
         } else {
             std::cerr << "Unknown command: " << command << "\n";
-            std::cerr << "Commands: list, upload, download, delete, status, quit\n";
+            std::cerr << "Commands: list, upload, download, delete, status, status <filename> quit\n";
         }
     }
 
