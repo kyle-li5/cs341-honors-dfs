@@ -62,14 +62,6 @@ std::atomic<int> client_count(0);
 // Shared mutex so concurrent threads don't interleave their console output
 std::mutex print_mutex;
 
-// 1 MB chunks: at our 3-node cluster size finer granularity (e.g., 64 KB)
-// gives no real load-balancing benefit and runs into macOS TCP behavior
-// (receiver-side delayed-ACK, no TCP_QUICKACK) that destabilizes the
-// pipelined chain at high chunk counts. 1 MB strikes the right balance —
-// 100 MB upload finishes in ~2 seconds across the live replicas.
-// NUM_REDUNDANCIES is in constants.hpp.
-const size_t CHUNK_SIZE = 1024*1024;
-
 struct ChunkMetadata {
     int chunk_index;
     size_t size;

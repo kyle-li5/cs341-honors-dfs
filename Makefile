@@ -1,39 +1,40 @@
 CXX      = g++
-CXXFLAGS = -std=c++17 -Wall -pthread -I.
+CXXFLAGS = -std=c++17 -Wall -pthread -Iinclude
 # -MMD -MP: auto-generate .d dependency files so header changes trigger recompilation
 DEPFLAGS = -MMD -MP
 
 # ── source lists ──────────────────────────────────────────────────────────────
-SERVER_SRCS   = tcpServer/server.cpp node_server.cpp tcp_helpers.cpp node/nodeinternal.cpp
-CLIENT_SRCS   = client.cpp tcp_helpers.cpp
+SERVER_SRCS   = tcpServer/server.cpp src/node_server.cpp src/tcp_helpers.cpp node/nodeinternal.cpp
+CLIENT_SRCS   = src/client.cpp src/tcp_helpers.cpp
 NODETEST_SRCS = node/nodeinternal.cpp node/nodeinternal-test.cpp
-MANAGER_SRCS  = manager.cpp   # old standalone prototype, not part of 'all'
 
 # ── object files (compiled into build/ to keep root clean) ────────────────────
 SERVER_OBJS   = $(patsubst %.cpp, build/%.o, $(SERVER_SRCS))
 CLIENT_OBJS   = $(patsubst %.cpp, build/%.o, $(CLIENT_SRCS))
 NODETEST_OBJS = $(patsubst %.cpp, build/%.o, $(NODETEST_SRCS))
-MANAGER_OBJS  = $(patsubst %.cpp, build/%.o, $(MANAGER_SRCS))
 
 # ── dependency files (auto-generated, one per .o) ─────────────────────────────
 DEPS = $(SERVER_OBJS:.o=.d) $(CLIENT_OBJS:.o=.d) \
-       $(NODETEST_OBJS:.o=.d) $(MANAGER_OBJS:.o=.d)
+       $(NODETEST_OBJS:.o=.d)
+
+# ── output directory ──────────────────────────────────────────────────────────
+BINDIR = bin
 
 # ── primary targets ───────────────────────────────────────────────────────────
-.PHONY: all server client node-test manager clean test test-edge run-server run-client tui run-tui
+.PHONY: all server client node-test clean test test-edge run-server run-client tui run-tui
 
-all: server client
+all: $(BINDIR)/server $(BINDIR)/client
 
-server: $(SERVER_OBJS)
+$(BINDIR)/server: $(SERVER_OBJS)
+	@mkdir -p $(BINDIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-client: $(CLIENT_OBJS)
+$(BINDIR)/client: $(CLIENT_OBJS)
+	@mkdir -p $(BINDIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-node-test: $(NODETEST_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
-
-manager: $(MANAGER_OBJS)
+$(BINDIR)/node-test: $(NODETEST_OBJS)
+	@mkdir -p $(BINDIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 # ── generic compile rule ──────────────────────────────────────────────────────
@@ -46,11 +47,11 @@ build/%.o: %.cpp
 -include $(DEPS)
 
 # ── convenience targets ───────────────────────────────────────────────────────
-run-server: server
-	./server
+run-server: $(BINDIR)/server
+	./$(BINDIR)/server
 
-run-client: client
-	./client localhost
+run-client: $(BINDIR)/client
+	./$(BINDIR)/client localhost
 
 tui:
 	pip install --quiet textual
@@ -58,12 +59,12 @@ tui:
 run-tui: tui
 	python3 dfs_tui.py
 
-test: server
+test: $(BINDIR)/server
 	python3 testing/test_client.py
 
-test-edge: server
+test-edge: $(BINDIR)/server
 	python3 testing/test_edge_cases.py
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 clean:
-	rm -rf build server client node-test manager
+	rm -rf build bin server client node-test

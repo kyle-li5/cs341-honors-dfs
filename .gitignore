@@ -7,3 +7,4 @@ build
 client
 server
 node-test
+venv/
