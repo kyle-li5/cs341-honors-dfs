@@ -1,8 +1,11 @@
 #include <iostream>
 #include <cstring>
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <fstream>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -95,36 +98,69 @@ static void cmd_list(int coordinator_fd) {
 
 // Reads a local file and uploads it to the coordinator.
 // Sends "UPLOAD <filename> <size>\n" then the raw file bytes.
+//
+// Uses POSIX open()/fstat()/read() instead of std::ifstream so we get real
+// errno reporting and can retry on EINTR. The previous ifstream-based code
+// silently swallowed the underlying open() error code, which made transient
+// failures look "nondeterministic" with no way to diagnose them.
 static void cmd_upload(int coordinator_fd, const std::string& filepath) {
-    std::ifstream input_file(filepath, std::ios::binary | std::ios::ate);
-    if (!input_file.is_open()) {
-        std::cerr << "Error: Cannot open file: " << filepath << "\n";
+    int file_fd;
+    while (true) {
+        file_fd = open(filepath.c_str(), O_RDONLY);
+        if (file_fd >= 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        std::cerr << "Error: Cannot open file: " << filepath
+                  << " (" << std::strerror(errno) << ")\n";
         return;
     }
 
-    // ios::ate positions the read head at the end so we can get file size
-    std::streamsize file_size = input_file.tellg();
-    input_file.seekg(0, std::ios::beg);
+    struct stat file_stat;
+    if (fstat(file_fd, &file_stat) != 0) {
+        std::cerr << "Error: Cannot stat file: " << filepath
+                  << " (" << std::strerror(errno) << ")\n";
+        close(file_fd);
+        return;
+    }
+    off_t file_size = file_stat.st_size;
 
     // Read the entire file into memory
     std::vector<char> file_buffer(file_size);
-    if (!input_file.read(file_buffer.data(), file_size)) {
-        std::cerr << "Error: Failed to read file: " << filepath << "\n";
-        return;
+    off_t total_read = 0;
+    while (total_read < file_size) {
+        ssize_t bytes_read = read(file_fd,
+                                  file_buffer.data() + total_read,
+                                  file_size - total_read);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "Error: Failed to read file: " << filepath
+                      << " (" << std::strerror(errno) << ")\n";
+            close(file_fd);
+            return;
+        }
+        if (bytes_read == 0) {
+            break; // EOF earlier than fstat reported
+        }
+        total_read += bytes_read;
     }
-    input_file.close();
+    close(file_fd);
 
     // Use just the filename, not the full path, as the stored name
     std::string filename = std::filesystem::path(filepath).filename().string();
 
     std::string upload_command = "UPLOAD " + filename + " "
-                                 + std::to_string(file_size) + "\n";
+                                 + std::to_string(total_read) + "\n";
     send_all(coordinator_fd, upload_command.c_str(), upload_command.size());
-    send_all(coordinator_fd, file_buffer.data(), file_size);
+    send_all(coordinator_fd, file_buffer.data(), total_read);
 
     std::string response = read_coordinator_line(coordinator_fd);
     if (response.substr(0, 2) == "OK") {
-        std::cout << "Uploaded " << filename << " (" << file_size << " bytes)\n";
+        std::cout << "Uploaded " << filename << " (" << total_read << " bytes)\n";
     } else {
         std::cerr << "Error: " << response << "\n";
     }

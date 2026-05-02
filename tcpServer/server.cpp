@@ -82,6 +82,10 @@ static off_t node_bytes[NUM_NODES] = {};
 // Protected by metadata_mutex.
 static std::set<std::pair<off_t, int>> node_min_heap;
 
+// Nodes that failed a recent operation. Excluded from upload routing until the
+// health-check loop confirms they are back. Protected by metadata_mutex.
+static std::unordered_set<int> dead_nodes;
+
 // Adjusts node_id's stored-byte count by delta and repositions it in the heap.
 // Must be called while holding metadata_mutex.
 static void update_node_size(int node_id, off_t delta) {
@@ -327,16 +331,25 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
             old_size     = existing->second.filesize;
         }
 
-        // Pick the REPLICATION_FACTOR least-loaded nodes from the heap.
+        // Pick the REPLICATION_FACTOR least-loaded *live* nodes, skipping any
+        // flagged dead by a prior failed operation.
         // NOTE: update_node_size erases and reinserts, invalidating iterators,
-        // so we must re-iterate after each update rather than advancing the
-        // original iterator.
-        primary_node_id = node_min_heap.begin()->second;
+        // so we re-iterate from begin() after each update.
+        for (const auto& entry : node_min_heap) {
+            if (!dead_nodes.count(entry.second)) {
+                primary_node_id = entry.second;
+                break;
+            }
+        }
+        if (primary_node_id < 0) {
+            send_response(client_fd, "ERROR No storage nodes available");
+            return;
+        }
         update_node_size(primary_node_id, (off_t)filesize);
 
         if (REPLICATION_FACTOR >= 2) {
             for (const auto& entry : node_min_heap) {
-                if (entry.second != primary_node_id) {
+                if (entry.second != primary_node_id && !dead_nodes.count(entry.second)) {
                     replica_node_id = entry.second;
                     update_node_size(replica_node_id, (off_t)filesize);
                     break;
@@ -349,6 +362,7 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     // Upload to primary — if this fails nothing was committed, undo and bail.
     if (!store_on_node(primary_node_id, filename, file_buffer)) {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        dead_nodes.insert(primary_node_id);
         update_node_size(primary_node_id, -(off_t)filesize);
         if (replica_node_id >= 0) {
             update_node_size(replica_node_id, -(off_t)filesize);
@@ -361,6 +375,7 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
     // Upload to replica (best-effort) — failure means degraded mode, not abort.
     if (replica_node_id >= 0 && !store_on_node(replica_node_id, filename, file_buffer)) {
         std::lock_guard<std::mutex> lock(metadata_mutex);
+        dead_nodes.insert(replica_node_id);
         update_node_size(replica_node_id, -(off_t)filesize);
         replica_node_id = -1;
         std::cerr << "[warn] replica upload failed for " << filename
@@ -475,8 +490,8 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
 }
 
 // Deletes from all nodes holding the file (primary + replica).
-// Succeeds if at least one node confirms deletion — if a node is down,
-// its stale copy becomes unreachable via the coordinator anyway.
+// Skips nodes already flagged dead to avoid the 5-second timeout per dead node.
+// Marks newly unresponsive nodes dead. Succeeds if at least one node confirms.
 void handle_delete(int client_fd, int client_id, const std::string& filename) {
     std::cout << "[Client " << client_id << "] DELETE " << filename << "\n";
 
@@ -494,19 +509,33 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
         filesize        = entry->second.filesize;
     }
 
-    auto try_delete = [&](int node_id) -> bool {
+    // Returns true if the node confirmed deletion.
+    // Skips (returns false) if already dead; marks dead on new failure.
+    auto try_delete_node = [&](int node_id) -> bool {
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            if (dead_nodes.count(node_id)) { return false; }
+        }
         int node_fd = connect_to_node(node_id);
-        if (node_fd < 0) { return false; }
+        if (node_fd < 0) {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            dead_nodes.insert(node_id);
+            return false;
+        }
         std::string cmd = "NODE_DELETE " + filename + "\n";
         send_all(node_fd, cmd.c_str(), cmd.size());
         std::string resp;
-        recv_line(node_fd, resp);
+        bool ok = (recv_line(node_fd, resp) == 0 && resp.substr(0, 2) == "OK");
         close(node_fd);
-        return resp.substr(0, 2) == "OK";
+        if (!ok) {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            dead_nodes.insert(node_id);
+        }
+        return ok;
     };
 
-    bool primary_deleted = try_delete(primary_node_id);
-    bool replica_deleted = (replica_node_id >= 0) && try_delete(replica_node_id);
+    bool primary_deleted = try_delete_node(primary_node_id);
+    bool replica_deleted = (replica_node_id >= 0) && try_delete_node(replica_node_id);
 
     if (!primary_deleted && !replica_deleted) {
         send_response(client_fd, "ERROR Failed to delete file from any node");
@@ -557,6 +586,50 @@ void handle_status(int client_fd, int client_id) {
                                 + std::to_string(file_count) + " "
                                 + std::to_string(total_bytes) + "\n";
         send_all(client_fd, node_line.c_str(), node_line.size());
+    }
+}
+
+// Background thread: every 10 seconds ping each dead node via NODE_STATUS.
+// If a node responds, revive it: remove from dead_nodes and sync its byte
+// count back into the heap so future uploads can route to it again.
+static void health_check_loop() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+
+        std::vector<int> to_check;
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            to_check.assign(dead_nodes.begin(), dead_nodes.end());
+        }
+
+        for (int node_id : to_check) {
+            int node_fd = connect_to_node(node_id);
+            if (node_fd < 0) { continue; }
+
+            std::string cmd = "NODE_STATUS\n";
+            send_all(node_fd, cmd.c_str(), cmd.size());
+            std::string resp;
+            if (recv_line(node_fd, resp) != 0) {
+                close(node_fd);
+                continue;
+            }
+            close(node_fd);
+
+            std::istringstream ss(resp);
+            std::string tag;
+            int file_count = 0;
+            long long total_bytes = 0;
+            ss >> tag >> file_count >> total_bytes;
+            if (tag != "STATUS") { continue; }
+
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            dead_nodes.erase(node_id);
+            node_min_heap.erase({node_bytes[node_id], node_id});
+            node_bytes[node_id] = (off_t)total_bytes;
+            node_min_heap.insert({node_bytes[node_id], node_id});
+            std::cout << "[health] node " << node_id << " revived ("
+                      << total_bytes << " bytes stored)\n";
+        }
     }
 }
 
@@ -647,6 +720,10 @@ int main() {
     // Rebuild the routing map from whatever files are already on the nodes,
     // so files from previous sessions are immediately accessible after restart.
     rebuild_metadata_from_nodes();
+
+    // Start background thread that pings dead nodes every 10s and revives them
+    // when they respond again (e.g. after a transient fault clears).
+    std::thread(health_check_loop).detach();
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
