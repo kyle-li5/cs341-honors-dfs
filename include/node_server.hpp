@@ -2,7 +2,6 @@
 
 #include <thread>
 #include <mutex>
-#include <vector>
 #include "nodeinternal.hpp"
 
 // Shared mutex for serializing console output across threads

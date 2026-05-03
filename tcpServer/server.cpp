@@ -7,8 +7,6 @@
 #include <vector>
 #include <atomic>
 #include <sstream>
-#include <fstream>
-#include <filesystem>
 #include <algorithm>
 
 // Added to support node routing and distributed storage
@@ -55,8 +53,6 @@
 //   STATUS                    - Show storage info across all nodes
 //   QUIT                      - Close connection
 
-namespace fs = std::filesystem;
-
 std::atomic<int> client_count(0);
 
 // Shared mutex so concurrent threads don't interleave their console output
@@ -88,7 +84,7 @@ static off_t node_bytes[NUM_NODES] = {};
 static std::set<std::pair<off_t, int>> node_min_heap;
 
 // Nodes that failed a recent operation. Excluded from upload routing until the
-// health-check loop confirms they are back. Protected by metadata_mutex.
+// health check confirms they are back online. Protected by metadata_mutex.
 static std::unordered_set<int> dead_nodes;
 
 // Adjusts node_id's stored-byte count by delta and repositions it in the heap.
@@ -97,6 +93,15 @@ static void update_node_size(int node_id, off_t delta) {
     node_min_heap.erase({node_bytes[node_id], node_id});
     node_bytes[node_id] += delta;
     node_min_heap.insert({node_bytes[node_id], node_id});
+}
+
+// Logs a node-down event to the console. Call after inserting into dead_nodes,
+// outside any lock, with print_mutex free.
+static void log_node_down(int node_id) {
+    std::lock_guard<std::mutex> plock(print_mutex);
+    std::cout << "\n*** NODE DOWN: Node " << node_id
+              << " (port " << (NODE_BASE_PORT + node_id) << ") went offline ***\n\n";
+    std::cout.flush();
 }
 
 // Global listen fd so the signal handler can close it on Ctrl+C
@@ -117,7 +122,7 @@ static void handle_shutdown_signal(int signal_number) {
 // the listen socket open but stops accepting, causing connects to succeed but
 // responses to never arrive). TCP_NODELAY disables Nagle so small per-chunk
 // ACKs aren't held back by the receiver's ~40 ms delayed-ACK timer — that
-// stalls the persistent NODE_STORE pipeline once kernel buffers fill.
+// stalls uploads once kernel buffers fill.
 static int connect_to_node(int node_id) {
     int connection_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (connection_fd < 0) {
@@ -254,7 +259,7 @@ static void rebuild_metadata_from_nodes() {
 
         file_metadata_map[filename] = file_metadata;
         std::cout << "[startup] recovered " << filename
-                    << " (" << file_metadata.total_size << "bytes)\n";
+                    << " (" << file_metadata.total_size << " bytes)\n";
     }
 
     // Build the heap from the recovered per-node totals.
@@ -284,10 +289,10 @@ void handle_list(int client_fd, int client_id) {
     }
 }
 
-// Receives the file from the client in CHUNK_SIZE pieces and forwards each chunk
-// to NUM_REDUNDANCIES nodes picked from the min-heap. Different chunks of the
-// same file can land on different node sets, so a single file's data spreads
-// across the cluster instead of piling onto two nodes.
+// Receives the file from the client in CHUNK_SIZE pieces. For each chunk, picks
+// NUM_REDUNDANCIES least-loaded live nodes from the min-heap and sends the chunk
+// to each replica in parallel via worker threads. Different chunks land on
+// different node pairs so a single file spreads evenly across the cluster.
 
 // Drains `to_drain` payload bytes the client is still flushing for a failed
 // or rejected upload. Without this the leftovers stay in the kernel TCP buffer
@@ -371,10 +376,12 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
 
     FileMetadata file_metadata;
     file_metadata.total_size = filesize;
-    size_t bytes_read     = 0;  // total bytes consumed from client_fd
-    int    chunk_index    = 0;
-    bool   upload_aborted = false;
-    bool   client_alive   = true;  // false if read_exact has already failed
+    size_t bytes_read          = 0;  // total bytes consumed from client_fd
+    int    chunk_index         = 0;
+    bool   upload_aborted      = false;
+    bool   client_alive        = true;  // false if read_exact has already failed
+    bool   reduced_replication = false; // true if any chunk landed on fewer replicas than requested
+    std::set<int> failed_nodes_during_upload; // tracks every node that died during this upload
 
     while (bytes_read < filesize) {
         size_t curr_chunk_size = std::min(CHUNK_SIZE, filesize - bytes_read);
@@ -452,6 +459,7 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
 
         // Roll back failed replicas, mark them dead, drop their broken fds.
         std::vector<int> committed_nodes;
+        std::vector<int> newly_dead;
         {
             std::lock_guard<std::mutex> lock(metadata_mutex);
             for (size_t i = 0; i < chunk_nodes.size(); ++i) {
@@ -460,7 +468,11 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
                 } else {
                     int nid = chunk_nodes[i];
                     update_node_size(nid, -(off_t)curr_chunk_size);
-                    dead_nodes.insert(nid);
+                    if (!dead_nodes.count(nid)) {
+                        dead_nodes.insert(nid);
+                        newly_dead.push_back(nid);
+                    }
+                    failed_nodes_during_upload.insert(nid);
                     auto it = node_fds.find(nid);
                     if (it != node_fds.end() && it->second >= 0) {
                         close(it->second);
@@ -469,11 +481,16 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
                 }
             }
         }
+        for (int nid : newly_dead) { log_node_down(nid); }
 
         if (committed_nodes.empty()) {
             upload_aborted = true;
             send_response(client_fd, "ERROR Storage node failed mid-upload");
             break;
+        }
+
+        if ((int)committed_nodes.size() < NUM_REDUNDANCIES) {
+            reduced_replication = true;
         }
 
         ChunkMetadata chunk_metadata;
@@ -568,11 +585,18 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         pending_uploads.erase(filename);
     }
 
-    if (is_overwrite) {
-        send_response(client_fd, "OK File updated successfully");
-    } else {
-        send_response(client_fd, "OK File uploaded successfully");
+    std::string ok_msg = is_overwrite ? "OK File updated successfully" : "OK File uploaded successfully";
+    if (reduced_replication && !failed_nodes_during_upload.empty()) {
+        ok_msg += " (WARNING: node(s) ";
+        bool first = true;
+        for (int nid : failed_nodes_during_upload) {
+            if (!first) { ok_msg += ", "; }
+            ok_msg += std::to_string(nid);
+            first = false;
+        }
+        ok_msg += " went offline during upload — some chunks have reduced replication)";
     }
+    send_response(client_fd, ok_msg);
 
     std::cout << "[Client " << client_id << "] Upload complete: " << filename << "\n";
 
@@ -636,11 +660,23 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
             // node; otherwise (first chunk, or fail-over to another replica)
             // open a fresh one.
             if (active_node != target_node_id) {
+                if (active_node >= 0) {
+                    std::lock_guard<std::mutex> plock(print_mutex);
+                    std::cout << "[download] node " << active_node << " unavailable for chunk "
+                              << chunk.chunk_index << ", failing over to node " << target_node_id << "\n";
+                }
                 close_active();
                 active_fd = connect_to_node(target_node_id);
                 if (active_fd < 0) {
-                    std::lock_guard<std::mutex> lock(metadata_mutex);
-                    dead_nodes.insert(target_node_id);
+                    bool newly_dead = false;
+                    {
+                        std::lock_guard<std::mutex> lock(metadata_mutex);
+                        if (!dead_nodes.count(target_node_id)) {
+                            dead_nodes.insert(target_node_id);
+                            newly_dead = true;
+                        }
+                    }
+                    if (newly_dead) { log_node_down(target_node_id); }
                     continue;
                 }
                 active_node = target_node_id;
@@ -666,9 +702,9 @@ void handle_download(int client_fd, int client_id, const std::string& filename) 
 
             // Parse "FILE <filename> <filesize>"
             std::istringstream response_stream(node_response);
-            std::string tag, received_filename;
+            std::string tag, dummy;
             size_t received_filesize;
-            response_stream >> tag >> received_filename >> received_filesize;
+            response_stream >> tag >> dummy >> received_filesize;
 
             std::vector<char> file_buffer(received_filesize);
             if (recv_file_data(active_fd, received_filesize, file_buffer.data()) != 0) {
@@ -731,7 +767,6 @@ void handle_delete(int client_fd, int client_id, const std::string& filename) {
                 std::lock_guard<std::mutex> lock(metadata_mutex);
                 dead_nodes.insert(target_node_id);
                 all_deleted = false;
-                // send_response(client_fd, "ERROR Could not reach storage node");
                 continue;
             }
 
@@ -774,6 +809,15 @@ void handle_status(int client_fd, int client_id) {
     send_all(client_fd, header.c_str(), header.size());
 
     for (int node_id = 0; node_id < NUM_NODES; node_id++) {
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            if (dead_nodes.count(node_id)) {
+                std::string offline_line = "NODE " + std::to_string(node_id) + " unreachable\n";
+                send_all(client_fd, offline_line.c_str(), offline_line.size());
+                continue;
+            }
+        }
+
         int node_connection_fd = connect_to_node(node_id);
         if (node_connection_fd < 0) {
             std::string unreachable_line = "NODE " + std::to_string(node_id) + " unreachable\n";
@@ -788,15 +832,15 @@ void handle_status(int client_fd, int client_id) {
         recv_line(node_connection_fd, node_response);
         close(node_connection_fd);
 
-        // Node responds with "STATUS <file_count> <total_bytes>"
+        // Node responds with "STATUS <chunk_count> <total_bytes>"
         std::istringstream response_stream(node_response);
         std::string tag;
-        int file_count = 0;
+        int chunk_count = 0;
         long long total_bytes = 0;
-        response_stream >> tag >> file_count >> total_bytes;
+        response_stream >> tag >> chunk_count >> total_bytes;
 
         std::string node_line = "NODE " + std::to_string(node_id) + " "
-                                + std::to_string(file_count) + " "
+                                + std::to_string(chunk_count) + " "
                                 + std::to_string(total_bytes) + "\n";
         send_all(client_fd, node_line.c_str(), node_line.size());
     }
@@ -837,9 +881,11 @@ void handle_status_file(int client_fd, int client_id, const std::string& filenam
     }
 }
 
-// Background thread: every 10 seconds ping each dead node via NODE_STATUS.
-// If a node responds, revive it: remove from dead_nodes and sync its byte
-// count back into the heap so future uploads can route to it again.
+
+// Periodically pings every blacklisted node via NODE_STATUS. If a node
+// responds it is removed from dead_nodes and reinserted into the min-heap
+// so future uploads route to it again. Detection of failures happens
+// reactively when an operation fails — this loop handles revival only.
 static void health_check_loop() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
@@ -857,26 +903,31 @@ static void health_check_loop() {
             std::string cmd = "NODE_STATUS\n";
             send_all(node_fd, cmd.c_str(), cmd.size());
             std::string resp;
-            if (recv_line(node_fd, resp) != 0) {
-                close(node_fd);
-                continue;
-            }
+            if (recv_line(node_fd, resp) != 0) { close(node_fd); continue; }
             close(node_fd);
 
             std::istringstream ss(resp);
             std::string tag;
-            int file_count = 0;
+            int chunk_count = 0;
             long long total_bytes = 0;
-            ss >> tag >> file_count >> total_bytes;
+            ss >> tag >> chunk_count >> total_bytes;
             if (tag != "STATUS") { continue; }
 
-            std::lock_guard<std::mutex> lock(metadata_mutex);
-            dead_nodes.erase(node_id);
-            node_min_heap.erase({node_bytes[node_id], node_id});
-            node_bytes[node_id] = (off_t)total_bytes;
-            node_min_heap.insert({node_bytes[node_id], node_id});
-            std::cout << "[health] node " << node_id << " revived ("
-                      << total_bytes << " bytes stored)\n";
+            {
+                std::lock_guard<std::mutex> lock(metadata_mutex);
+                dead_nodes.erase(node_id);
+                node_min_heap.erase({node_bytes[node_id], node_id});
+                node_bytes[node_id] = (off_t)total_bytes;
+                node_min_heap.insert({node_bytes[node_id], node_id});
+            }
+            {
+                std::lock_guard<std::mutex> plock(print_mutex);
+                std::cout << "\n*** NODE UP: Node " << node_id
+                          << " (port " << (NODE_BASE_PORT + node_id)
+                          << ") is back online ("
+                          << total_bytes / (1024 * 1024) << " MB stored) ***\n\n";
+                std::cout.flush();
+            }
         }
     }
 }
@@ -976,8 +1027,6 @@ int main() {
     // so files from previous sessions are immediately accessible after restart.
     rebuild_metadata_from_nodes();
 
-    // Start background thread that pings dead nodes every 10s and revives them
-    // when they respond again (e.g. after a transient fault clears).
     std::thread(health_check_loop).detach();
 
     // Create socket
@@ -1022,7 +1071,6 @@ int main() {
     std::cout << "Server listening on port 9000...\n";
     std::cout << "Press Ctrl+C to stop\n\n";
 
-    std::vector<std::thread> threads;
     int next_client_id = 1;
 
     while (true) {
@@ -1036,9 +1084,7 @@ int main() {
         client_count++;
         std::cout << "Active clients: " << client_count << "\n";
 
-        // Create a new thread to handle this client
-        threads.emplace_back(handle_client, client_fd, next_client_id++);
-        threads.back().detach();  // Detach so thread cleans up automatically
+        std::thread(handle_client, client_fd, next_client_id++).detach();
     }
 
     close(server_fd);

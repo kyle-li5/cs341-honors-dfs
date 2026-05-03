@@ -9,10 +9,8 @@
 #include <cstdio>
 #include <sstream>
 #include <iostream>
-#include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <arpa/inet.h>
 #include <netinet/tcp.h>
 
 NodeServer::NodeServer(int node_id)
@@ -336,11 +334,11 @@ void NodeServer::handle_status(int connection_fd) {
     std::lock_guard<std::mutex> lock(storage_mutex);
 
     char **file_list = local_storage.list_files();
-    int file_count = 0;
+    int chunk_count = 0;
     if (file_list != nullptr) {
-        while (file_list[file_count] != nullptr) {
-            free(file_list[file_count]);
-            file_count++;
+        while (file_list[chunk_count] != nullptr) {
+            free(file_list[chunk_count]);
+            chunk_count++;
         }
         free(file_list);
     }
@@ -350,7 +348,7 @@ void NodeServer::handle_status(int connection_fd) {
         total_bytes_stored = 0;
     }
 
-    std::string response = "STATUS " + std::to_string(file_count) + " "
+    std::string response = "STATUS " + std::to_string(chunk_count) + " "
                          + std::to_string((long long)total_bytes_stored) + "\n";
     send_all(connection_fd, response.c_str(), response.size());
 }

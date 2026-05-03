@@ -7,7 +7,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <fstream>
-#include <arpa/inet.h>
 #include <netdb.h>
 #include <vector>
 #include <sstream>
@@ -17,22 +16,7 @@
 #include "constants.hpp"
 
 // ---------------------------------------------------------------------------
-// Original chunk-based upload logic (kept from original client.cpp).
-// The round-robin chunk-to-node routing that was here has been moved into
-// the coordinator on the server side, so the client now talks only to the
-// coordinator on port 9000. The CHUNK_SIZE constant and data_info struct
-// are kept here for reference and for future sharding work.
-// ---------------------------------------------------------------------------
-
-struct data_info {
-    int chunk_id;
-    int size;
-};
-
-// ---------------------------------------------------------------------------
 // TCP helpers used by all commands.
-// These mirror the helpers in tcp_helpers.cpp but operate on the
-// coordinator connection fd rather than node connections.
 // ---------------------------------------------------------------------------
 
 // Reads one newline-terminated line from the coordinator.
@@ -125,6 +109,12 @@ static void cmd_upload(int coordinator_fd, const std::string& filepath) {
     }
     off_t file_size = file_stat.st_size;
 
+    std::string filename = std::filesystem::path(filepath).filename().string();
+
+    if (file_size >= 5 * 1024 * 1024) {
+        std::cout << "  Reading " << filename << " (" << file_size / (1024*1024) << " MB)...\n" << std::flush;
+    }
+
     // Read the entire file into memory
     std::vector<char> file_buffer(file_size);
     off_t total_read = 0;
@@ -149,16 +139,36 @@ static void cmd_upload(int coordinator_fd, const std::string& filepath) {
     close(file_fd);
 
     // Use just the filename, not the full path, as the stored name
-    std::string filename = std::filesystem::path(filepath).filename().string();
-
     std::string upload_command = "UPLOAD " + filename + " "
                                  + std::to_string(total_read) + "\n";
     send_all(coordinator_fd, upload_command.c_str(), upload_command.size());
-    send_all(coordinator_fd, file_buffer.data(), total_read);
+
+    // Send file in 1 MB increments and print progress for files >= 5 MB
+    bool show_progress = (total_read >= 5 * 1024 * 1024);
+    size_t sent = 0;
+    int last_pct = -1;
+    static const size_t SEND_CHUNK = 1024 * 1024;
+    while (sent < (size_t)total_read) {
+        size_t to_send = std::min(SEND_CHUNK, (size_t)total_read - sent);
+        if (send_all(coordinator_fd, file_buffer.data() + sent, to_send) != 0) { break; }
+        sent += to_send;
+        if (show_progress) {
+            int pct = (int)(sent * 100 / (size_t)total_read);
+            if (pct / 10 > last_pct / 10) {
+                std::cout << "\r  Uploading... " << pct << "%" << std::flush;
+                last_pct = pct;
+            }
+        }
+    }
+    if (show_progress) { std::cout << "\r" << std::string(25, ' ') << "\r" << std::flush; }
 
     std::string response = read_coordinator_line(coordinator_fd);
     if (response.substr(0, 2) == "OK") {
         std::cout << "Uploaded " << filename << " (" << total_read << " bytes)\n";
+        size_t warn_pos = response.find("WARNING:");
+        if (warn_pos != std::string::npos) {
+            std::cerr << "Warning: " << response.substr(warn_pos) << "\n";
+        }
     } else {
         std::cerr << "Error: " << response << "\n";
     }
@@ -183,7 +193,34 @@ static void cmd_download(int coordinator_fd, const std::string& filename) {
     response_stream >> tag >> file_size;
 
     std::vector<char> file_buffer(file_size);
-    if (recv_file_data(coordinator_fd, file_size, file_buffer.data()) != 0) {
+
+    // Receive in 1 MB increments and print progress for files >= 5 MB
+    bool show_progress = (file_size >= 5 * 1024 * 1024);
+    size_t received = 0;
+    int last_pct = -1;
+    static const size_t RECV_CHUNK = 1024 * 1024;
+    bool recv_ok = true;
+    while (received < file_size) {
+        size_t to_recv = std::min(RECV_CHUNK, file_size - received);
+        size_t chunk_got = 0;
+        while (chunk_got < to_recv) {
+            ssize_t n = recv(coordinator_fd, file_buffer.data() + received + chunk_got,
+                             to_recv - chunk_got, 0);
+            if (n <= 0) { recv_ok = false; break; }
+            chunk_got += (size_t)n;
+        }
+        if (!recv_ok) { break; }
+        received += to_recv;
+        if (show_progress) {
+            int pct = (int)(received * 100 / file_size);
+            if (pct / 10 > last_pct / 10) {
+                std::cout << "\r  Downloading... " << pct << "%" << std::flush;
+                last_pct = pct;
+            }
+        }
+    }
+    if (show_progress) { std::cout << "\r" << std::string(27, ' ') << "\r" << std::flush; }
+    if (!recv_ok) {
         std::cerr << "Error: Connection lost while receiving file data\n";
         return;
     }
@@ -214,7 +251,7 @@ static void cmd_delete(int coordinator_fd, const std::string& filename) {
 }
 
 // Requests STATUS from the coordinator and prints per-node storage info.
-// Server responds with "OK <node_count>\n" then one "NODE <id> <files> <bytes>\n" per node.
+// Server responds with "OK <node_count>\n" then one "NODE <id> <chunks> <bytes>\n" per node.
 static void cmd_status(int coordinator_fd) {
     std::string request = "STATUS\n";
     send_all(coordinator_fd, request.c_str(), request.size());
@@ -234,7 +271,7 @@ static void cmd_status(int coordinator_fd) {
     for (int i = 0; i < node_count; i++) {
         std::string node_line = read_coordinator_line(coordinator_fd);
 
-        // Each line is either "NODE <id> <files> <bytes>" or "NODE <id> unreachable"
+        // Each line is either "NODE <id> <chunks> <bytes>" or "NODE <id> unreachable"
         std::istringstream line_stream(node_line);
         std::string node_tag;
         int node_id = 0;
@@ -242,12 +279,12 @@ static void cmd_status(int coordinator_fd) {
         line_stream >> node_tag >> node_id >> field_a >> field_b;
 
         if (field_a == "unreachable") {
-            std::cout << "  Node " << node_id << ": unreachable\n";
+            std::cout << "  Node " << node_id << ": *** OFFLINE ***\n";
         } else {
-            long long file_count  = std::stoll(field_a);
+            long long chunk_count = std::stoll(field_a);
             long long total_bytes = std::stoll(field_b);
-            std::cout << "  Node " << node_id << ": "
-                      << file_count << " file(s), "
+            std::cout << "  Node " << node_id << " [ONLINE]: "
+                      << chunk_count << " chunk(s), "
                       << total_bytes << " bytes\n";
         }
     }
@@ -351,7 +388,7 @@ int main(int argc, char* argv[]) {
     std::cout << welcome << "\n\n";
 
     std::cout << "Commands: list, upload <filepath>, download <filename>, "
-              << "delete <filename>, status, quit\n\n";
+              << "delete <filename>, status, status <filename>, quit\n\n";
 
     // Interactive command loop
     while (true) {

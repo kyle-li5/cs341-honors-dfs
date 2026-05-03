@@ -71,7 +71,7 @@ def load_bar(used: int, total: int, width: int = 14) -> str:
 async def fetch_node_status(node_id: int) -> dict:
     """
     Open a one-shot connection to node NODE_BASE_PORT+node_id and send
-    NODE_STATUS.  Response: "STATUS <file_count> <total_bytes>"
+    NODE_STATUS.  Response: "STATUS <chunk_count> <total_bytes>"
     """
     try:
         r, w = await asyncio.wait_for(
@@ -84,10 +84,10 @@ async def fetch_node_status(node_id: int) -> dict:
         w.close()
         p = line.split()
         if len(p) == 3 and p[0] == "STATUS":
-            return {"id": node_id, "files": int(p[1]), "bytes": int(p[2]), "reachable": True}
+            return {"id": node_id, "chunks": int(p[1]), "bytes": int(p[2]), "reachable": True}
     except Exception:
         pass
-    return {"id": node_id, "files": 0, "bytes": 0, "reachable": False}
+    return {"id": node_id, "chunks": 0, "bytes": 0, "reachable": False}
 
 
 # ── coordinator connection ─────────────────────────────────────────────────
@@ -307,7 +307,7 @@ class DFSApp(App):
                 yield Label("Storage Nodes", classes="panel-title")
                 for i in range(NUM_NODES):
                     yield Static(classes="node-card", id=f"node-{i}")
-            # Right: file table sourced from NODE_LIST on all nodes
+            # Right: file table sourced from coordinator LIST + STATUS per file
             with Vertical(id="files-panel"):
                 yield Label("Files", id="files-title", classes="panel-title")
                 tbl = DataTable(id="files-table", zebra_stripes=True, cursor_type="row")
@@ -323,6 +323,7 @@ class DFSApp(App):
     # ── startup ────────────────────────────────────────────────────────────
 
     async def on_mount(self):
+        self._node_reachable: dict[int, bool] = {}
         self._log = self.query_one("#log-panel", RichLog)
         try:
             welcome = await self._coord.connect()
@@ -363,18 +364,29 @@ class DFSApp(App):
             nid  = s["id"]
             port = NODE_BASE_PORT + nid
             card = self.query_one(f"#node-{nid}", Static)
+            prev = self._node_reachable.get(nid)
             if not s["reachable"]:
+                if prev is not False:
+                    self.query_one("#log-panel", RichLog).write(
+                        f"[red]*** NODE DOWN: Node {nid} (port {port}) went offline ***[/]"
+                    )
+                self._node_reachable[nid] = False
                 card.update(
-                    f"[bold]Node {nid}[/]  [dim]:{port}[/]  [red]● UNREACHABLE[/]\n"
+                    f"[bold]Node {nid}[/]  [dim]:{port}[/]  [red]● OFFLINE[/]\n"
                     f"  [dim]—[/]\n"
                 )
             else:
+                if prev is False:
+                    self.query_one("#log-panel", RichLog).write(
+                        f"[green]*** NODE UP: Node {nid} (port {port}) is back online ***[/]"
+                    )
+                self._node_reachable[nid] = True
                 pct   = (s["bytes"] / total_bytes * 100) if total_bytes else 0
                 bar   = load_bar(s["bytes"], total_bytes)
-                files = f"{s['files']} chunk{'s' if s['files'] != 1 else ''}"
+                chunks = f"{s['chunks']} chunk{'s' if s['chunks'] != 1 else ''}"
                 card.update(
                     f"[bold cyan]Node {nid}[/]  [dim]:{port}[/]  [green]●[/]\n"
-                    f"  {files}  ·  {fmt_bytes(s['bytes'])}\n"
+                    f"  {chunks}  ·  {fmt_bytes(s['bytes'])}\n"
                     f"  [yellow]{bar}[/]  {pct:.0f}%\n"
                 )
 
@@ -439,6 +451,9 @@ class DFSApp(App):
             if resp.startswith("OK"):
                 sz = Path(arg).stat().st_size if Path(arg).exists() else 0
                 self._log.write(f"[green]✓ {name} uploaded  ({fmt_bytes(sz)})[/]")
+                if "WARNING" in resp:
+                    warn = resp[resp.find("WARNING"):]
+                    self._log.write(f"[yellow]⚠ {warn}[/]")
             else:
                 self._log.write(f"[red]{resp}[/]")
             await self._refresh()
