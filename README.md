@@ -68,7 +68,7 @@ Currently our DFS uses three processes to simulate three nodes.
    ```
    Or
    ```bash
-   python3 src/dfs_tui.py 192.168.1.42 9000
+   python3 src/dfs_tui.py [hostname/IP] [port]
    ```
    To connect to the server by hostname or ip address.
 
