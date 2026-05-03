@@ -339,26 +339,27 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         return;
     }
 
-    // Pick the chosen nodes ONCE and pin them for the whole upload, then open
-    // a single TCP connection to the head and reuse it for every chunk. The
-    // node_server now reads commands in a loop, so it accepts back-to-back
-    // NODE_STORE headers + payloads on the same socket. With NUM_REDUNDANCIES
-    // == NUM_NODES every chunk lands on every node anyway, so pinning the
-    // head doesn't affect distribution — it just spares us ~3 TCP setups per
-    // chunk. The head pipelines forward to the rest of chosen_nodes via its
-    // own (also persistent, see node_server.cpp) forward connection.
-    std::vector<int> chosen_nodes;
+    // Open persistent connections to ALL live nodes once. Per chunk we pick
+    // the NUM_REDUNDANCIES least-loaded from the heap and reuse the already
+    // open connections to those nodes. This gives true per-chunk distribution
+    // (a single file's chunks spread across the cluster) without paying TCP
+    // handshake cost per chunk.
+    std::unordered_map<int, int> node_fds; // node_id -> persistent fd
     {
         std::lock_guard<std::mutex> lock(metadata_mutex);
-        for (auto it = node_min_heap.begin();
-             it != node_min_heap.end() && (int)chosen_nodes.size() < NUM_REDUNDANCIES;
-             ++it) {
-            if (dead_nodes.count(it->second)) { continue; }
-            chosen_nodes.push_back(it->second);
+        for (const auto& entry : node_min_heap) {
+            int nid = entry.second;
+            if (dead_nodes.count(nid)) { continue; }
+            int fd = connect_to_node(nid);
+            if (fd >= 0) {
+                node_fds[nid] = fd;
+            } else {
+                dead_nodes.insert(nid);
+            }
         }
     }
 
-    if (chosen_nodes.empty()) {
+    if (node_fds.empty()) {
         {
             std::lock_guard<std::mutex> lock(metadata_mutex);
             pending_uploads.erase(filename);
@@ -367,34 +368,6 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         drain_upload_remainder(client_fd, filesize);
         return;
     }
-
-    // Try chosen_nodes in heap order until one accepts a connection — that
-    // becomes the head for the whole upload.
-    int    node_connection_fd = -1;
-    size_t head_index         = 0;
-    for (; head_index < chosen_nodes.size(); ++head_index) {
-        node_connection_fd = connect_to_node(chosen_nodes[head_index]);
-        if (node_connection_fd >= 0) { break; }
-        std::cerr << "ERROR Failed to connect to node "
-                  << chosen_nodes[head_index] << ", attempting next node...\n";
-        std::lock_guard<std::mutex> lock(metadata_mutex);
-        dead_nodes.insert(chosen_nodes[head_index]);
-    }
-
-    if (node_connection_fd < 0) {
-        {
-            std::lock_guard<std::mutex> lock(metadata_mutex);
-            pending_uploads.erase(filename);
-        }
-        send_response(client_fd, "ERROR Cannot upload file, all chosen nodes are offline");
-        drain_upload_remainder(client_fd, filesize);
-        return;
-    }
-
-    // Nodes that will actually hold copies of every chunk: the pinned head
-    // plus everything after it in chosen_nodes. Any nodes before head_index
-    // were unreachable at upload start.
-    std::vector<int> live_redundancies(chosen_nodes.begin() + head_index, chosen_nodes.end());
 
     FileMetadata file_metadata;
     file_metadata.total_size = filesize;
@@ -414,49 +387,90 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
             send_response(client_fd, "ERROR Connection lost during upload");
             break;
         }
-        // We've consumed curr_chunk_size bytes from the client. Track this
-        // immediately so the abort path knows how many bytes are still in
-        // flight from the client's sendall and can drain them — otherwise
-        // they pollute the next command read on this persistent connection.
         bytes_read += curr_chunk_size;
+
+        // Pick NUM_REDUNDANCIES least-loaded live nodes for THIS chunk only.
+        // node_min_heap reflects byte reservations from prior chunks so each
+        // chunk picks differently and load spreads across all nodes.
+        std::vector<int> chunk_nodes;
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            for (const auto& entry : node_min_heap) {
+                int nid = entry.second;
+                if (dead_nodes.count(nid)) { continue; }
+                auto it = node_fds.find(nid);
+                if (it == node_fds.end() || it->second < 0) { continue; }
+                chunk_nodes.push_back(nid);
+                if ((int)chunk_nodes.size() >= NUM_REDUNDANCIES) { break; }
+            }
+        }
+
+        if (chunk_nodes.empty()) {
+            upload_aborted = true;
+            send_response(client_fd, "ERROR No live storage nodes available");
+            break;
+        }
 
         // Reserve bytes on every node that will hold this chunk so concurrent
         // uploads see updated load and route around us.
         {
             std::lock_guard<std::mutex> lock(metadata_mutex);
-            for (int node_id : live_redundancies) {
-                update_node_size(node_id, (off_t)curr_chunk_size);
+            for (int nid : chunk_nodes) {
+                update_node_size(nid, (off_t)curr_chunk_size);
             }
         }
 
         std::string chunk_filename = filename + "_chunk" + std::to_string(chunk_index);
-        std::string store_command = "NODE_STORE " + chunk_filename + " "
-                                    + std::to_string(curr_chunk_size);
 
-        // logic for pipelining redundancy logic so it pushes to all chosen nodes at the same time
-        int remaining_redundancy_nodes = (int)live_redundancies.size() - 1;
-        if (remaining_redundancy_nodes > 0) {
-            store_command += " " + std::to_string(remaining_redundancy_nodes);
-            for (size_t i = 1; i < live_redundancies.size(); ++i) {
-                store_command += " " + std::to_string(live_redundancies[i]);
+        // Send the chunk buffer to each replica node in parallel via worker
+        // threads so a slow or failed replica does not block the other.
+        std::vector<int> successful_nodes(chunk_nodes.size(), -1);
+        std::vector<std::thread> workers;
+        workers.reserve(chunk_nodes.size());
+
+        for (size_t i = 0; i < chunk_nodes.size(); ++i) {
+            workers.emplace_back([i, &chunk_nodes, &node_fds, &chunk_filename,
+                                  &chunk_buff, curr_chunk_size, &successful_nodes]() {
+                int nid = chunk_nodes[i];
+                int fd  = node_fds[nid];
+                if (fd < 0) { return; }
+
+                std::string cmd = "NODE_STORE " + chunk_filename + " "
+                                  + std::to_string(curr_chunk_size) + "\n";
+                if (send_all(fd, cmd.c_str(), cmd.size()) != 0) { return; }
+                if (send_all(fd, chunk_buff.data(), curr_chunk_size) != 0) { return; }
+
+                std::string ack;
+                if (recv_line(fd, ack) != 0) { return; }
+                if (ack.substr(0, 2) != "OK") { return; }
+
+                successful_nodes[i] = nid;
+            });
+        }
+
+        for (auto& w : workers) { w.join(); }
+
+        // Roll back failed replicas, mark them dead, drop their broken fds.
+        std::vector<int> committed_nodes;
+        {
+            std::lock_guard<std::mutex> lock(metadata_mutex);
+            for (size_t i = 0; i < chunk_nodes.size(); ++i) {
+                if (successful_nodes[i] >= 0) {
+                    committed_nodes.push_back(successful_nodes[i]);
+                } else {
+                    int nid = chunk_nodes[i];
+                    update_node_size(nid, -(off_t)curr_chunk_size);
+                    dead_nodes.insert(nid);
+                    auto it = node_fds.find(nid);
+                    if (it != node_fds.end() && it->second >= 0) {
+                        close(it->second);
+                        it->second = -1;
+                    }
+                }
             }
         }
-        store_command += "\n";
 
-        // send to head node over the persistent connection
-        send_all(node_connection_fd, store_command.c_str(), store_command.size());
-        send_all(node_connection_fd, chunk_buff.data(), curr_chunk_size);
-
-        std::string node_response;
-        if (recv_line(node_connection_fd, node_response) != 0
-                || node_response.substr(0, 2) != "OK") {
-            // Head died or returned an error mid-upload. Roll back the byte
-            // reservations for this chunk and abort.
-            std::lock_guard<std::mutex> lock(metadata_mutex);
-            for (int node_id : live_redundancies) {
-                update_node_size(node_id, -(off_t)curr_chunk_size);
-            }
-            dead_nodes.insert(chosen_nodes[head_index]);
+        if (committed_nodes.empty()) {
             upload_aborted = true;
             send_response(client_fd, "ERROR Storage node failed mid-upload");
             break;
@@ -465,13 +479,15 @@ void handle_upload(int client_fd, int client_id, const std::string& filename, si
         ChunkMetadata chunk_metadata;
         chunk_metadata.chunk_index    = chunk_index;
         chunk_metadata.size           = curr_chunk_size;
-        chunk_metadata.redundancy_ids = live_redundancies;
+        chunk_metadata.redundancy_ids = committed_nodes;
         file_metadata.chunks.push_back(chunk_metadata);
 
         chunk_index++;
     }
 
-    close(node_connection_fd);
+    for (auto& kv : node_fds) {
+        if (kv.second >= 0) { close(kv.second); }
+    }
 
     if (upload_aborted) {
         // Drain any upload bytes the client is still flushing so they don't

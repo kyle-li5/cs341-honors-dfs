@@ -30,14 +30,8 @@ private:
     void handle_connection(int connection_fd);
 
     // Receives file bytes from the connection and stores them via NodeInternal.
-    // forward_fd / forward_target_node carry the persistent pipeline socket
-    // across chunks within the same upstream connection; handle_store reuses
-    // the existing socket when the redundancy chain hasn't changed and resets
-    // both to -1 on connect failure or downstream ack timeout. handle_connection
-    // owns the fd lifecycle and closes it when the upstream peer disconnects.
-    void handle_store(int connection_fd, const std::string &filename, size_t filesize,
-                      std::vector<int>& redundant_nodes,
-                      int &forward_fd, int &forward_target_node);
+    // The coordinator sends each replica directly so no forwarding is needed.
+    void handle_store(int connection_fd, const std::string &filename, size_t filesize);
 
     // Reads a stored file via NodeInternal and sends its bytes back over the connection.
     void handle_retrieve(int connection_fd, const std::string &filename);

@@ -102,14 +102,7 @@ void NodeServer::run() {
 // stream many NODE_STORE chunks down a single TCP socket without paying a
 // connect/close round trip per chunk. The loop exits when recv_line fails
 // (peer disconnected, RST, or 5s read timeout).
-//
-// forward_fd / forward_target_node persist across NODE_STORE commands within
-// this connection so the head→mid (and mid→tail) hop also stays open across
-// chunks instead of re-connecting per chunk.
 void NodeServer::handle_connection(int connection_fd) {
-    int forward_fd          = -1;
-    int forward_target_node = -1;
-
     while (true) {
         std::string command_line;
         if (recv_line(connection_fd, command_line) != 0) {
@@ -123,24 +116,13 @@ void NodeServer::handle_connection(int connection_fd) {
         if (command == "NODE_STORE") {
             std::string filename;
             size_t filesize;
-            int num_redundancies = 0;
-            std::vector<int> redundant_nodes;
 
             if (!(command_stream >> filename >> filesize)) {
                 std::string error_response = "ERROR invalid NODE_STORE syntax\n";
                 send_all(connection_fd, error_response.c_str(), error_response.size());
                 continue;
             }
-            if (command_stream >> num_redundancies) {
-                for (int i = 0; i < num_redundancies; ++i) {
-                    int next_node_id;
-                    if (command_stream >> next_node_id) {
-                        redundant_nodes.push_back(next_node_id);
-                    }
-                }
-            }
-            handle_store(connection_fd, filename, filesize, redundant_nodes,
-                         forward_fd, forward_target_node);
+            handle_store(connection_fd, filename, filesize);
 
         } else if (command == "NODE_RETRIEVE") {
             std::string filename;
@@ -171,13 +153,6 @@ void NodeServer::handle_connection(int connection_fd) {
             send_all(connection_fd, error_response.c_str(), error_response.size());
         }
     }
-
-    // Tear down the persistent forward socket when our upstream goes away —
-    // the downstream peer's recv_line will then return failure and its loop
-    // will fall through here too, so the chain unwinds cleanly.
-    if (forward_fd >= 0) {
-        close(forward_fd);
-    }
 }
 
 // Receives the file bytes from the connection, writes them into a pipe, and
@@ -186,15 +161,9 @@ void NodeServer::handle_connection(int connection_fd) {
 // not a buffer. We use a thread to write into the pipe while NodeInternal
 // reads from it simultaneously to avoid a deadlock.
 //
-// forward_fd is owned by handle_connection and persists across NODE_STORE
-// commands on this connection — we open it lazily on the first chunk that
-// has redundancies, reuse it for every later chunk, and only close + reopen
-// if the redundancy chain's first hop changes (rare; only on dead-node
-// failover at the coordinator). pipe_writer no longer closes node_fd for the
-// same reason.
-void NodeServer::handle_store(int connection_fd, const std::string &filename, size_t filesize,
-                              std::vector<int>& redundant_nodes,
-                              int &forward_fd, int &forward_target_node) {
+// Receives file bytes from the connection, pipes them to NodeInternal, and ACKs.
+// The coordinator sends each replica directly so no node-to-node forwarding needed.
+void NodeServer::handle_store(int connection_fd, const std::string &filename, size_t filesize) {
     int pipe_fds[2];
     if (pipe(pipe_fds) != 0) {
         perror("node_server pipe");
@@ -203,84 +172,7 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         return;
     }
 
-    // Make sure the persistent forward socket points at the right next-hop.
-    // If the redundancy list changed between chunks (coordinator failed over
-    // to a different chain) tear down the old forward and open a new one.
-    if (!redundant_nodes.empty()) {
-        int next_node = redundant_nodes[0];
-
-        if (forward_fd >= 0 && forward_target_node != next_node) {
-            close(forward_fd);
-            forward_fd          = -1;
-            forward_target_node = -1;
-        }
-
-        if (forward_fd < 0) {
-            int new_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-            // Match the coordinator's 5s recv/send timeouts so a downstream node
-            // dying mid-pipeline doesn't hang this node forever on the ack.
-            struct timeval timeout;
-            timeout.tv_sec  = 5;
-            timeout.tv_usec = 0;
-            setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            setsockopt(new_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-            int nodelay = 1;
-            setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-            struct sockaddr_in sockaddr;
-            memset(&sockaddr, 0, sizeof(sockaddr));
-            sockaddr.sin_family = AF_INET;
-            sockaddr.sin_port   = htons(NODE_BASE_PORT + next_node);
-            inet_pton(AF_INET, "127.0.0.1", &sockaddr.sin_addr);
-
-            if (connect(new_fd, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == 0) {
-                forward_fd          = new_fd;
-                forward_target_node = next_node;
-            } else {
-                std::cerr << "[node " << node_id << "] warning: failed to connect to node "
-                          << next_node << "\n";
-                close(new_fd);
-            }
-        }
-    }
-
-    // Send the per-chunk forward command (header only) over the persistent
-    // forward socket. Bytes follow inside the pipe_writer loop below.
-    if (forward_fd >= 0) {
-        std::string forward_command = "NODE_STORE " + filename + " " + std::to_string(filesize);
-        int remaining_nodes = (int)redundant_nodes.size() - 1;
-        if (remaining_nodes > 0) {
-            forward_command += " " + std::to_string(remaining_nodes);
-            for (size_t i = 1; i < redundant_nodes.size(); ++i) {
-                forward_command += " " + std::to_string(redundant_nodes[i]);
-            }
-        }
-        forward_command += "\n";
-        send_all(forward_fd, forward_command.c_str(), forward_command.size());
-    }
-
-    // Spawn a thread to stream bytes from the connection into the write end
-    // of the pipe while NodeInternal reads from the read end simultaneously.
-    // The thread is joined (not detached) before we ACK the upstream caller —
-    // its tail does recv_line(forward_fd, ack), so joining ensures the downstream
-    // chain has finished writing before we tell our caller "OK". Without this
-    // a STATUS query right after upload could see the tail node missing the
-    // last chunk because the head ACKed before the chain caught up.
-    //
-    // forward_ok records whether we got a clean OK from the next hop. If not,
-    // handle_connection's persistent forward_fd is unsafe to reuse for the
-    // next chunk — we close it below and let the next chunk reopen.
-    int  node_fd     = forward_fd;
-    bool forward_ok  = (node_fd < 0); // no forward expected → trivially "ok"
-    std::thread pipe_writer([connection_fd, filesize, node_fd, write_end_fd = pipe_fds[1], &forward_ok]() {
-        // 64 KB local buffer: BUFFER_SIZE = 4 KB fragments each NODE_STORE
-        // payload into 16 small TCP sends per chunk, and on macOS those
-        // small sends collide with the receiver's delayed-ACK timer at
-        // scale (cwnd/quickack heuristics stop firing). One read/write
-        // per chunk avoids that and is the difference between ~50 s and
-        // ~3 s for a 100 MB upload.
+    std::thread pipe_writer([connection_fd, filesize, write_end_fd = pipe_fds[1]]() {
         char chunk[64 * 1024];
         size_t bytes_remaining = filesize;
 
@@ -307,24 +199,10 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
                 bytes_written += (size_t)result;
             }
 
-            // forward to next-hop node over the persistent pipeline socket
-            if (node_fd >= 0) {
-                send_all(node_fd, chunk, bytes_received);
-            }
             bytes_remaining -= (size_t)bytes_received;
         }
         done:
         close(write_end_fd);
-
-        // Consume the per-chunk ACK from the next hop so the next chunk's
-        // exchange starts with a clean read state. We do NOT close node_fd —
-        // handle_connection owns that lifecycle now.
-        if (node_fd >= 0) {
-            std::string ack;
-            if (recv_line(node_fd, ack) == 0 && ack.substr(0, 2) == "OK") {
-                forward_ok = true;
-            }
-        }
     });
 
     int store_result;
@@ -335,30 +213,13 @@ void NodeServer::handle_store(int connection_fd, const std::string &filename, si
         } else {
             store_result = local_storage.create_file(filename.c_str(), pipe_fds[0]);
         }
-        // A failed op can leave NodeInternal's cached byte total drifted —
-        // recompute it so subsequent NODE_STATUS queries stay accurate.
         if (store_result != 0) {
             local_storage.compute_node_size();
         }
     }
     close(pipe_fds[0]);
 
-    // Wait for the pipe_writer (which is also waiting on the downstream ACK)
-    // before responding, so our OK happens-after the entire chain's writes.
     pipe_writer.join();
-
-    // If the downstream chain went silent (timeout, RST, garbage response),
-    // tear down the persistent forward socket so the next chunk on this
-    // connection re-opens it. We still ACK upstream because our LOCAL store
-    // succeeded — the chunk is safe on this node, the rest of the chain is
-    // degraded but recoverable.
-    if (forward_fd >= 0 && !forward_ok) {
-        std::cerr << "[node " << node_id << "] forward chain to node "
-                  << forward_target_node << " went silent, recycling socket\n";
-        close(forward_fd);
-        forward_fd          = -1;
-        forward_target_node = -1;
-    }
 
     if (store_result != 0) {
         std::string error_response = "ERROR failed to store file\n";
