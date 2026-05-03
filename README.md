@@ -75,10 +75,10 @@ Currently our DFS uses three processes to simulate three nodes.
 ### Usage and Examples
 
 ### Team Contributions:
-**Hayden:**
+**Hayden:** Implemented on NodeInternal class, handled direct interactions with server-side filesystem, and added metadata for identifying errors.
 
-**Jacob:**
+**Jacob:** Implemented fault-tolerance, file replication, and file distribution logic for the server.
 
-**Joey:**
+**Joey:** Created the UI for the distributed file system, and implemented some tests to confirm basic functionality.
 
-**Kyle:**
+**Kyle:** Implemented server logic to split and distribute files into set-size chunks across nodes as well as create redundant copies of each chunk
