@@ -1,5 +1,6 @@
 # CS341 Honors Distributed File System
 We are creating a Raspberry Pi NAS Server From Scratch (Distributed File System)
+
 Our goals were to: 
 * Handle client-server communication through TCP/IP
 * Enable clients to perform basic actions such as storing, retrieving, manipulating, and deleting files from the server
