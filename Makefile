@@ -57,7 +57,7 @@ tui:
 	pip install --quiet textual
 
 run-tui: tui
-	python3 dfs_tui.py
+	python3 src/dfs_tui.py
 
 test: $(BINDIR)/server
 	python3 testing/test_client.py
