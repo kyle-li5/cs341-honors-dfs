@@ -371,7 +371,7 @@ class DFSApp(App):
             else:
                 pct   = (s["bytes"] / total_bytes * 100) if total_bytes else 0
                 bar   = load_bar(s["bytes"], total_bytes)
-                files = f"{s['files']} file{'s' if s['files'] != 1 else ''}"
+                files = f"{s['files']} chunk{'s' if s['files'] != 1 else ''}"
                 card.update(
                     f"[bold cyan]Node {nid}[/]  [dim]:{port}[/]  [green]●[/]\n"
                     f"  {files}  ·  {fmt_bytes(s['bytes'])}\n"
