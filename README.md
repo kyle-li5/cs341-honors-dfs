@@ -13,7 +13,7 @@ The DFS support uploading, downloading, and deleting files stored in the server,
 
 Currently our DFS uses three processes to simulate three nodes.
 
-### Installation and setup
+## Installation and setup
 ### Prerequisites
 *Server is intended to be run on a Linux-based system (Raspberry Pi)*
 * Git
@@ -73,9 +73,26 @@ Currently our DFS uses three processes to simulate three nodes.
    ```
    To connect to the server by hostname or ip address.
 
-### Usage and Examples
+## Usage and Examples
+### TUI when first starting the app:
+<img width="1212" height="1031" alt="341h-ss1" src="https://github.com/user-attachments/assets/bc9dbc2e-0cc5-442a-8ba8-169c3e070adb" />
 
-### Team Contributions:
+### Typing "list" refreshes the interface:
+<img width="1212" height="1025" alt="341h-ss1-refresh" src="https://github.com/user-attachments/assets/f6639aae-f967-482d-a1d6-a47ebefd7a60" />
+
+### Can upload files using the "upload" command:
+<img width="1212" height="1028" alt="341h-ss-upload1" src="https://github.com/user-attachments/assets/4889fcab-9aa5-457e-a824-dbdf572e1cfe" />
+<img width="1210" height="1022" alt="341h-ss-upload2" src="https://github.com/user-attachments/assets/a9eff6d4-276a-4cf4-ade1-aa8e037d505e" />
+
+### Can download files using the "download" command:
+<img width="1212" height="1023" alt="341h-ss-download1" src="https://github.com/user-attachments/assets/bea08d25-6619-4905-b475-49442153f893" />
+<img width="1212" height="1022" alt="341h-ss-download2" src="https://github.com/user-attachments/assets/c85e6fd0-0bd2-4305-8220-8f562fa72a4d" />
+
+### Can delete files using the "delete" command:
+<img width="1208" height="1023" alt="341h-ss-delete1" src="https://github.com/user-attachments/assets/abb9ed96-5e94-426c-b20c-9b193ed8bc6a" />
+
+
+## Team Contributions:
 **Hayden:** Implemented on NodeInternal class, handled direct interactions with server-side filesystem, and added metadata for identifying errors.
 
 **Jacob:** Implemented fault-tolerance, file replication, and file distribution logic for the server.
