@@ -22,7 +22,7 @@ Currently our DFS uses three processes to simulate three nodes.
 
 ### Steps
 1. **Clone the repository**
-  ```bash
+   ```bash
    git clone https://github.com/kyle-li5/cs341-honors-dfs.git
    cd cs341-honors-dfs
    ```
