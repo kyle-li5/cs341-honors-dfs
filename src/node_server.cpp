@@ -28,40 +28,22 @@ void NodeServer::start() {
     background_thread.detach();
 }
 
-// Spawns a new background thread reusing the existing bound listen_fd.
-// Called by REVIVE_NODE after the previous thread was killed via NODE_KILL.
-void NodeServer::restart() {
-    background_thread = std::thread(&NodeServer::run, this);
-    background_thread.detach();
-}
-
 // Sets up the TCP listener on NODE_BASE_PORT + node_id, then accepts and
-// handles one connection at a time in a loop. If listen_fd is already set
-// (restarted after NODE_KILL), skips socket setup and goes straight to accept.
+// handles one connection at a time in a loop.
 void NodeServer::run() {
-    if (listen_fd < 0) {
-        // Check if the node crashed mid-operation last time and clean up before
-        // accepting any connections, so NODE_LIST never returns a corrupt file.
-        int error = local_storage.check_error();
-        if (error == 2 || error == 5) {
-            char *bad_file = local_storage.get_error_info(2);
-            if (bad_file != nullptr) {
-                local_storage.delete_file(bad_file);
-                free(bad_file);
-            }
-        } else if (error == 4) {
-            local_storage.clear_existing_data();
+    // Check if the node crashed mid-operation last time and clean up before
+    // accepting any connections, so NODE_LIST never returns a corrupt file.
+    int error = local_storage.check_error();
+    if (error == 2 || error == 5) {
+        char *bad_file = local_storage.get_error_info(2);
+        if (bad_file != nullptr) {
+            local_storage.delete_file(bad_file);
+            free(bad_file);
         }
+    } else if (error == 4) {
+        local_storage.clear_existing_data();
     }
 
-    if (listen_fd >= 0) {
-        std::lock_guard<std::mutex> lock(print_mutex);
-        std::cout << "[node " << node_id << "] restarted on port "
-                  << (NODE_BASE_PORT + node_id) << "\n";
-        std::cout.flush();
-    }
-
-    if (listen_fd < 0) {
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("node_server socket");
@@ -96,7 +78,6 @@ void NodeServer::run() {
                   << (NODE_BASE_PORT + node_id) << "\n";
         std::cout.flush();
     }
-    } // end if (listen_fd < 0) socket setup block
 
     while (true) {
         int connection_fd = accept(listen_fd, nullptr, nullptr);

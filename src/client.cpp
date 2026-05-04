@@ -389,7 +389,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Commands: list, upload <filepath>, download <filename>, "
               << "delete <filename>, status, status <filename>, "
-              << "kill_node <id>, revive_node <id>, quit\n\n";
+              << "kill_node <id>, quit\n\n";
 
     // Interactive command loop
     while (true) {
@@ -459,19 +459,9 @@ int main(int argc, char* argv[]) {
                 send_all(coordinator_fd, req.c_str(), req.size());
                 std::cout << read_coordinator_line(coordinator_fd) << "\n";
             }
-        } else if (command == "revive_node" || command == "revive") {
-            std::string node_id;
-            input_stream >> node_id;
-            if (node_id.empty()) {
-                std::cerr << "Usage: revive_node <node_id>\n";
-            } else {
-                std::string req = "REVIVE_NODE " + node_id + "\n";
-                send_all(coordinator_fd, req.c_str(), req.size());
-                std::cout << read_coordinator_line(coordinator_fd) << "\n";
-            }
         } else {
             std::cerr << "Unknown command: " << command << "\n";
-            std::cerr << "Commands: list, upload, download, delete, status, status <filename>, kill_node, revive_node, quit\n";
+            std::cerr << "Commands: list, upload, download, delete, status, status <filename>, kill_node, quit\n";
         }
     }
 

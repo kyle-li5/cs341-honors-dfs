@@ -20,12 +20,8 @@ public:
     // Spawns a background thread and starts listening for incoming connections.
     void start();
 
-    // Spawns a new background thread reusing the existing bound listen_fd.
-    // Used by REVIVE_NODE after the thread was killed via NODE_KILL.
-    void restart();
-
     // Blocking accept loop that handles one connection at a time.
-    // Called internally by start() and restart().
+    // Called internally by start().
     void run();
 
 private:

@@ -86,10 +86,9 @@ static std::set<std::pair<off_t, int>> node_min_heap;
 // Nodes that failed a recent operation. Excluded from upload routing until the
 // health check confirms they are back online. Protected by metadata_mutex.
 static std::unordered_set<int> dead_nodes;
-static std::unordered_set<int> reviving_nodes; // nodes restarted but not yet confirmed by health check
 
-// Global node server instances so KILL_NODE / REVIVE_NODE handlers can
-// reach them without threading the vector through every call.
+// Global node server instances so the KILL_NODE handler can reach them
+// without threading the vector through every call.
 static std::vector<NodeServer *> storage_nodes;
 
 // Adjusts node_id's stored-byte count by delta and repositions it in the heap.
@@ -921,7 +920,6 @@ static void health_check_loop() {
             {
                 std::lock_guard<std::mutex> lock(metadata_mutex);
                 dead_nodes.erase(node_id);
-                reviving_nodes.erase(node_id);
                 node_min_heap.erase({node_bytes[node_id], node_id});
                 node_bytes[node_id] = (off_t)total_bytes;
                 node_min_heap.insert({node_bytes[node_id], node_id});
@@ -1033,36 +1031,8 @@ void handle_client(int client_fd, int client_id) {
                     }
                 }
             }
-        } else if (cmd == "REVIVE_NODE") {
-            int node_id = -1;
-            iss >> node_id;
-            if (node_id < 0 || node_id >= NUM_NODES) {
-                send_response(client_fd, "ERROR Usage: REVIVE_NODE <node_id>");
-            } else {
-                bool is_dead = false;
-                {
-                    std::lock_guard<std::mutex> lock(metadata_mutex);
-                    is_dead = dead_nodes.count(node_id) > 0;
-                }
-                if (!is_dead) {
-                    send_response(client_fd, "ERROR Node " + std::to_string(node_id) + " is not offline");
-                } else {
-                    bool already_reviving = false;
-                    {
-                        std::lock_guard<std::mutex> lock(metadata_mutex);
-                        already_reviving = reviving_nodes.count(node_id) > 0;
-                        if (!already_reviving) { reviving_nodes.insert(node_id); }
-                    }
-                    if (already_reviving) {
-                        send_response(client_fd, "ERROR Node " + std::to_string(node_id) + " is already restarting");
-                    } else {
-                        storage_nodes[node_id]->restart();
-                        send_response(client_fd, "OK Node " + std::to_string(node_id) + " restarting, health check will confirm when online");
-                    }
-                }
-            }
         } else {
-            send_response(client_fd, "ERROR Unknown command. Available: LIST, UPLOAD, DOWNLOAD, DELETE, STATUS, KILL_NODE, REVIVE_NODE, QUIT");
+            send_response(client_fd, "ERROR Unknown command. Available: LIST, UPLOAD, DOWNLOAD, DELETE, STATUS, KILL_NODE, QUIT");
         }
     }
 
