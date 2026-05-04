@@ -235,6 +235,20 @@ class Coordinator:
             await self._send(f"DELETE {filename}\n".encode())
             return await self._readline()
 
+    async def kill_node(self, node_id: int) -> str:
+        if err := self._guard():
+            return err
+        async with self._lock:
+            await self._send(f"KILL_NODE {node_id}\n".encode())
+            return await self._readline()
+
+    async def revive_node(self, node_id: int) -> str:
+        if err := self._guard():
+            return err
+        async with self._lock:
+            await self._send(f"REVIVE_NODE {node_id}\n".encode())
+            return await self._readline()
+
 
 # ── Textual app ────────────────────────────────────────────────────────────
 
@@ -314,7 +328,7 @@ class DFSApp(App):
                 tbl.add_columns("Filename", "Size", "Chunks", "Distribution")
                 yield tbl
         yield Input(
-            placeholder="list  upload <path>  download <name>  delete <name>  help  quit",
+            placeholder="list  upload <path>  download <name>  delete <name>  kill_node <id>  revive_node <id>  help  quit",
             id="cmd-input",
         )
         yield RichLog(id="log-panel", markup=True, highlight=True)
@@ -483,6 +497,40 @@ class DFSApp(App):
                 self._log.write(f"[red]{resp}[/]")
             await self._refresh()
 
+        # ── kill_node ──────────────────────────────────────────────────────
+        elif cmd in ("kill_node", "kill"):
+            if not arg:
+                self._log.write("[yellow]Usage: kill_node <node_id>[/]")
+                return
+            try:
+                nid = int(arg)
+            except ValueError:
+                self._log.write("[red]Node id must be a number[/]")
+                return
+            resp = await self._coord.kill_node(nid)
+            if resp.startswith("OK"):
+                self._log.write(f"[red]*** NODE DOWN: Node {nid} killed ***[/]")
+            else:
+                self._log.write(f"[red]{resp}[/]")
+            await self._refresh()
+
+        # ── revive_node ────────────────────────────────────────────────────
+        elif cmd in ("revive_node", "revive"):
+            if not arg:
+                self._log.write("[yellow]Usage: revive_node <node_id>[/]")
+                return
+            try:
+                nid = int(arg)
+            except ValueError:
+                self._log.write("[red]Node id must be a number[/]")
+                return
+            resp = await self._coord.revive_node(nid)
+            if resp.startswith("OK"):
+                self._log.write(f"[yellow]Node {nid} restarting — health check will confirm when online[/]")
+            else:
+                self._log.write(f"[red]{resp}[/]")
+            await self._refresh()
+
         # ── help ───────────────────────────────────────────────────────────
         elif cmd in ("help", "h", "?"):
             self._log.write(
@@ -491,6 +539,8 @@ class DFSApp(App):
                 "  [cyan]upload[/] [dim]<local-path>[/]       upload a local file to the DFS\n"
                 "  [cyan]download[/] [dim]<filename>[/]       download a file to this directory\n"
                 "  [cyan]delete[/] [dim]<filename>[/]         delete a file from the DFS\n"
+                "  [cyan]kill_node[/] [dim]<id>[/]            kill a storage node\n"
+                "  [cyan]revive_node[/] [dim]<id>[/]          revive a killed storage node\n"
                 "  [cyan]quit[/] / [cyan]q[/]                 exit\n"
                 "  [cyan]F5[/] / [cyan]Ctrl+L[/]             refresh everything"
             )
